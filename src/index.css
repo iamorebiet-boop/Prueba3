@@ -1,0 +1,120 @@
+@import "tailwindcss";
+
+@theme {
+  --font-display: "Plus Jakarta Sans", ui-sans-serif, system-ui, sans-serif;
+  --font-sans: "Public Sans", ui-sans-serif, system-ui, sans-serif;
+  --font-mono: "IBM Plex Mono", ui-monospace, SFMono-Regular, monospace;
+}
+
+@layer base {
+  html {
+    font-family: var(--font-sans);
+    scroll-behavior: smooth;
+    background-color: #f3f5f8;
+  }
+
+  h1,
+  h2,
+  h3,
+  h4 {
+    font-family: var(--font-display);
+  }
+}
+
+.tabular-nums {
+  font-variant-numeric: tabular-nums;
+}
+
+/* Precision Landscape A4 Print Styles matching reference layout */
+@media print {
+  @page {
+    size: A4 landscape;
+    margin: 8mm;
+  }
+
+  html,
+  body {
+    background: #ffffff !important;
+    color: #0f172a !important;
+    -webkit-print-color-adjust: exact !important;
+    print-color-adjust: exact !important;
+    margin: 0 !important;
+    padding: 0 !important;
+  }
+
+  .no-print {
+    display: none !important;
+  }
+
+  .print-only {
+    display: block !important;
+  }
+
+  .printable-grid {
+    border: none !important;
+    border-radius: 0 !important;
+    box-shadow: none !important;
+    background: #ffffff !important;
+    padding: 0 !important;
+    margin: 0 !important;
+    overflow: visible !important;
+    break-inside: avoid;
+    page-break-inside: avoid;
+  }
+
+  /* When printing ALL grids, put each cuadrícula cleanly on its own page */
+  body[data-print-target="ALL"] .printable-grid {
+    break-after: page;
+    page-break-after: always;
+  }
+
+  body[data-print-target="ALL"] .printable-grid:last-of-type {
+    break-after: auto;
+    page-break-after: auto;
+  }
+
+  /* When printing a single cuadrícula, hide the other */
+  body[data-print-target="edif-p"] .printable-grid:not([data-grid-id="edif-p"]),
+  body[data-print-target="especiales"] .printable-grid:not([data-grid-id="especiales"]) {
+    display: none !important;
+  }
+
+  .timetable-scroll-wrap {
+    overflow: visible !important;
+  }
+
+  .timetable-table {
+    width: 100% !important;
+    min-width: 0 !important;
+    table-layout: fixed !important;
+    font-size: 8.5px !important;
+  }
+
+  .timetable-room-col {
+    position: static !important;
+    width: 158px !important;
+    padding: 2px 6px !important;
+    font-size: 9px !important;
+  }
+
+  .timetable-table th,
+  .timetable-table td {
+    height: 18px !important;
+  }
+
+  .timetable-slot-occupied {
+    background-color: #dc2626 !important;
+    -webkit-print-color-adjust: exact !important;
+    print-color-adjust: exact !important;
+  }
+
+  .timetable-slot-subject-match {
+    background-color: #16a34a !important;
+    -webkit-print-color-adjust: exact !important;
+    print-color-adjust: exact !important;
+  }
+
+  .timetable-slot-free {
+    background-color: #ffffff !important;
+  }
+}

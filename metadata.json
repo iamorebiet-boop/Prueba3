@@ -1,0 +1,6 @@
+{
+  "name": "EIB 306 · Horarios Edificio P y Salas",
+  "description": "Cuadrículas diarias de ocupación de aulas del Edificio P (350) y Salas Especiales de la Escuela de Ingeniería de Bilbao (Centro 306, UPV/EHU) sincronizadas en tiempo real con WebUntis.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
