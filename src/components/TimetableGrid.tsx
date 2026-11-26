@@ -4,6 +4,7 @@ import {
   Clock,
   GraduationCap,
   Highlighter,
+  MapPin,
   Printer,
   User,
   Users,
@@ -16,6 +17,8 @@ import type {
   PeriodDetail,
   RoomDaySchedule,
   RoomGroupId,
+  TeacherInfo,
+  TeacherScheduleResponse,
 } from '../data/roomGroups';
 import {
   formatWebUntisDayHeader,
@@ -28,7 +31,9 @@ interface TimetableGridProps {
   currentSlotIndex: number | null;
   highlightedSlotIndex: number | null;
   subjectQuery: string;
+  teacherQuery: string;
   onSelectSubject: (subjectName: string) => void;
+  onSelectTeacher: (teacherName: string) => void;
   onPrintGrid: (gridId: RoomGroupId) => void;
 }
 
@@ -38,6 +43,9 @@ interface SelectedCell {
   occupied: boolean;
   details: PeriodDetail[];
 }
+
+// Client-side cache for fetched daily teacher schedules to avoid duplicate network calls
+const teacherScheduleClientCache = new Map<string, TeacherScheduleResponse>();
 
 function getSlotDetails(
   room: RoomDaySchedule,
@@ -60,6 +68,25 @@ function matchesSubjectPeriod(
     detail.groups.some((g) =>
       normalizeSearchText(g).includes(normalizedSubject)
     )
+  );
+}
+
+function matchesTeacherPeriod(
+  detail: PeriodDetail,
+  normalizedTeacher: string
+): boolean {
+  if (!normalizedTeacher) return false;
+  if (
+    detail.teachers.some((t) =>
+      normalizeSearchText(t).includes(normalizedTeacher)
+    )
+  ) {
+    return true;
+  }
+  return (detail.teacherDetails ?? []).some(
+    (t) =>
+      normalizeSearchText(t.fullName).includes(normalizedTeacher) ||
+      normalizeSearchText(t.code).includes(normalizedTeacher)
   );
 }
 
@@ -100,19 +127,115 @@ export function TimetableGrid({
   currentSlotIndex,
   highlightedSlotIndex,
   subjectQuery,
+  teacherQuery,
   onSelectSubject,
+  onSelectTeacher,
   onPrintGrid,
 }: TimetableGridProps) {
   const normalizedSubject = useMemo(
     () => normalizeSearchText(subjectQuery),
     [subjectQuery]
   );
+  const normalizedTeacher = useMemo(
+    () => normalizeSearchText(teacherQuery),
+    [teacherQuery]
+  );
+  const hasActiveSearchHighlight =
+    normalizedSubject.length > 0 || normalizedTeacher.length > 0;
 
   const [selectedCell, setSelectedCell] = useState<SelectedCell | null>(null);
+  const [selectedTeacherId, setSelectedTeacherId] = useState<number | null>(
+    null
+  );
+  const [teacherSchedule, setTeacherSchedule] =
+    useState<TeacherScheduleResponse | null>(null);
+  const [teacherLoading, setTeacherLoading] = useState(false);
+  const [teacherError, setTeacherError] = useState<string | null>(null);
 
   useEffect(() => {
     setSelectedCell(null);
+    setSelectedTeacherId(null);
+    setTeacherSchedule(null);
+    setTeacherError(null);
   }, [dateIso]);
+
+  // Unique teachers across all periods in the clicked cell
+  const cellTeachers: TeacherInfo[] = useMemo(() => {
+    if (!selectedCell || !selectedCell.occupied) return [];
+    const map = new Map<number, TeacherInfo>();
+    for (const d of selectedCell.details) {
+      for (const t of d.teacherDetails ?? []) {
+        if (!map.has(t.id)) map.set(t.id, t);
+      }
+    }
+    return Array.from(map.values());
+  }, [selectedCell]);
+
+  // Automatically pick the first professor when selecting an occupied cell
+  useEffect(() => {
+    if (cellTeachers.length > 0) {
+      setSelectedTeacherId((prev) =>
+        prev && cellTeachers.some((t) => t.id === prev)
+          ? prev
+          : cellTeachers[0].id
+      );
+    } else {
+      setSelectedTeacherId(null);
+      setTeacherSchedule(null);
+      setTeacherError(null);
+    }
+  }, [cellTeachers]);
+
+  // Fetch the selected professor's complete live schedule for this day
+  useEffect(() => {
+    if (!selectedTeacherId) {
+      setTeacherSchedule(null);
+      setTeacherLoading(false);
+      return;
+    }
+
+    const cacheKey = `${selectedTeacherId}:${dateIso}`;
+    const cached = teacherScheduleClientCache.get(cacheKey);
+    if (cached) {
+      setTeacherSchedule(cached);
+      setTeacherLoading(false);
+      setTeacherError(null);
+      return;
+    }
+
+    const controller = new AbortController();
+    setTeacherLoading(true);
+    setTeacherError(null);
+
+    const qs = new URLSearchParams({
+      teacherId: String(selectedTeacherId),
+      date: dateIso,
+    });
+    fetch(`/api/teacher-schedule?${qs.toString()}`, {
+      signal: controller.signal,
+    })
+      .then(async (res) => {
+        const data = (await res.json()) as TeacherScheduleResponse & {
+          error?: string;
+        };
+        if (!res.ok) {
+          throw new Error(data.error || `Error HTTP ${res.status}`);
+        }
+        teacherScheduleClientCache.set(cacheKey, data);
+        setTeacherSchedule(data);
+      })
+      .catch((err) => {
+        if (err instanceof DOMException && err.name === 'AbortError') return;
+        setTeacherError('No se pudo cargar el horario completo del docente.');
+      })
+      .finally(() => {
+        if (!controller.signal.aborted) {
+          setTeacherLoading(false);
+        }
+      });
+
+    return () => controller.abort();
+  }, [selectedTeacherId, dateIso]);
 
   const webUntisDateHeader = formatWebUntisDayHeader(dateIso);
   const occupancyPct =
@@ -146,7 +269,9 @@ export function TimetableGrid({
               {grid.subtitle} · {grid.rooms.length}{' '}
               {grid.isSpecial ? 'espacios' : 'aulas'} · Fuente: ehu.webuntis.com
               {normalizedSubject.length > 0 &&
-                ` · Filtro: ${subjectQuery.trim()}`}
+                ` · Asignatura: ${subjectQuery.trim()}`}
+              {normalizedTeacher.length > 0 &&
+                ` · Profesorado: ${teacherQuery.trim()}`}
             </p>
           </div>
           <div className="text-right font-mono tabular-nums text-xs font-semibold text-slate-900">
@@ -253,115 +378,302 @@ export function TimetableGrid({
               </div>
 
               {selectedCell.occupied ? (
-                <div className="pt-4 space-y-3">
-                  <div className="grid grid-cols-1 lg:grid-cols-2 gap-3">
-                    {selectedCell.details.map((detail) => {
-                      const detailMatches = matchesSubjectPeriod(
-                        detail,
-                        normalizedSubject
-                      );
-                      const isExactSelected =
-                        normalizeSearchText(detail.subject) ===
-                          normalizedSubject && normalizedSubject.length > 0;
-                      return (
-                        <div
-                          key={`${detail.id}-${detail.startTime}`}
-                          className={`bg-white border rounded-xl p-3.5 space-y-2 ${
-                            detailMatches
-                              ? 'border-emerald-300 ring-1 ring-emerald-200/70'
-                              : 'border-slate-200'
-                          }`}
-                        >
-                          <div className="flex items-start justify-between gap-3">
-                            <div className="flex items-start gap-2 min-w-0">
-                              <BookOpen
-                                className={`w-4 h-4 shrink-0 mt-0.5 ${
-                                  detailMatches
-                                    ? 'text-emerald-600'
-                                    : 'text-red-600'
-                                }`}
-                              />
-                              <div className="min-w-0">
-                                <p className="text-sm font-semibold text-slate-900 leading-snug">
-                                  {detail.subject}
-                                </p>
-                                {detail.subjectAlt && (
-                                  <p className="text-xs text-slate-500 mt-0.5">
-                                    {detail.subjectAlt}
+                <div className="grid grid-cols-1 xl:grid-cols-12 gap-5 pt-4">
+                  {/* Left: Session / Booking details */}
+                  <div className="xl:col-span-6 space-y-3">
+                    <h3 className="text-xs font-semibold text-slate-500">
+                      Información de la ocupación
+                    </h3>
+                    <div className="space-y-3">
+                      {selectedCell.details.map((detail) => {
+                        const detailMatchesSubject = matchesSubjectPeriod(
+                          detail,
+                          normalizedSubject
+                        );
+                        const detailMatchesTeacher = matchesTeacherPeriod(
+                          detail,
+                          normalizedTeacher
+                        );
+                        const isExactSubject =
+                          normalizeSearchText(detail.subject) ===
+                            normalizedSubject && normalizedSubject.length > 0;
+                        const primaryTeacherName = detail.teachers[0] ?? '';
+                        const isExactTeacher =
+                          primaryTeacherName.length > 0 &&
+                          normalizeSearchText(primaryTeacherName) ===
+                            normalizedTeacher;
+
+                        return (
+                          <div
+                            key={`${detail.id}-${detail.startTime}`}
+                            className={`bg-white border rounded-xl p-3.5 space-y-2 ${
+                              detailMatchesSubject
+                                ? 'border-emerald-300 ring-1 ring-emerald-200/70'
+                                : detailMatchesTeacher
+                                  ? 'border-blue-300 ring-1 ring-blue-200/70'
+                                  : 'border-slate-200'
+                            }`}
+                          >
+                            <div className="flex items-start justify-between gap-3">
+                              <div className="flex items-start gap-2 min-w-0">
+                                <BookOpen
+                                  className={`w-4 h-4 shrink-0 mt-0.5 ${
+                                    detailMatchesSubject
+                                      ? 'text-emerald-600'
+                                      : detailMatchesTeacher
+                                        ? 'text-blue-600'
+                                        : 'text-red-600'
+                                  }`}
+                                />
+                                <div className="min-w-0">
+                                  <p className="text-sm font-semibold text-slate-900 leading-snug">
+                                    {detail.subject}
                                   </p>
-                                )}
+                                  {detail.subjectAlt && (
+                                    <p className="text-xs text-slate-500 mt-0.5">
+                                      {detail.subjectAlt}
+                                    </p>
+                                  )}
+                                </div>
                               </div>
+                              <span
+                                className={`font-mono tabular-nums text-xs font-semibold whitespace-nowrap shrink-0 ${
+                                  detailMatchesSubject
+                                    ? 'text-emerald-700'
+                                    : detailMatchesTeacher
+                                      ? 'text-blue-700'
+                                      : 'text-red-700'
+                                }`}
+                              >
+                                {detail.startLabel} – {detail.endLabel}
+                              </span>
                             </div>
-                            <span
-                              className={`font-mono tabular-nums text-xs font-semibold whitespace-nowrap shrink-0 ${
-                                detailMatches
-                                  ? 'text-emerald-700'
-                                  : 'text-red-700'
+
+                            <div className="flex flex-wrap items-center gap-x-4 gap-y-1.5 pt-1 text-xs text-slate-600">
+                              {detail.teacherDetails.length > 0 ? (
+                                <span className="inline-flex items-center gap-1.5">
+                                  <User className="w-3.5 h-3.5 text-slate-400 shrink-0" />
+                                  <span>
+                                    {detail.teacherDetails
+                                      .map((t) =>
+                                        t.fullName !== t.code
+                                          ? `${t.fullName} (${t.code})`
+                                          : t.code
+                                      )
+                                      .join(', ')}
+                                  </span>
+                                </span>
+                              ) : detail.teachers.length > 0 ? (
+                                <span className="inline-flex items-center gap-1.5">
+                                  <User className="w-3.5 h-3.5 text-slate-400 shrink-0" />
+                                  <span>{detail.teachers.join(', ')}</span>
+                                </span>
+                              ) : null}
+                              {detail.groups.length > 0 && (
+                                <span className="inline-flex items-center gap-1.5">
+                                  <GraduationCap className="w-3.5 h-3.5 text-slate-400 shrink-0" />
+                                  <span>{detail.groups.join(', ')}</span>
+                                </span>
+                              )}
+                              {detail.lessonText &&
+                                detail.lessonText !== detail.subject && (
+                                  <span className="text-slate-500">
+                                    {detail.lessonText}
+                                  </span>
+                                )}
+                              {detail.isExam && (
+                                <span className="font-semibold text-red-800">
+                                  Examen
+                                </span>
+                              )}
+                            </div>
+
+                            {(detail.periodText || detail.substText) && (
+                              <p className="text-xs text-slate-500 pt-0.5">
+                                {[detail.periodText, detail.substText]
+                                  .filter(Boolean)
+                                  .join(' · ')}
+                              </p>
+                            )}
+
+                            <div className="pt-1.5 border-t border-slate-100 flex flex-wrap justify-end gap-2">
+                              {primaryTeacherName && (
+                                <button
+                                  type="button"
+                                  onClick={() =>
+                                    onSelectTeacher(
+                                      isExactTeacher ? '' : primaryTeacherName
+                                    )
+                                  }
+                                  className={`inline-flex items-center gap-1.5 px-2.5 py-1 text-xs font-medium rounded-lg transition-colors cursor-pointer whitespace-nowrap ${
+                                    isExactTeacher
+                                      ? 'bg-blue-600 text-white hover:bg-blue-700'
+                                      : 'text-blue-700 bg-blue-50 hover:bg-blue-100'
+                                  }`}
+                                >
+                                  <User className="w-3.5 h-3.5" />
+                                  <span>
+                                    {isExactTeacher
+                                      ? 'Quitar docente'
+                                      : 'Marcar docente en azul'}
+                                  </span>
+                                </button>
+                              )}
+                              <button
+                                type="button"
+                                onClick={() =>
+                                  onSelectSubject(
+                                    isExactSubject ? '' : detail.subject
+                                  )
+                                }
+                                className={`inline-flex items-center gap-1.5 px-2.5 py-1 text-xs font-medium rounded-lg transition-colors cursor-pointer whitespace-nowrap ${
+                                  isExactSubject
+                                    ? 'bg-emerald-600 text-white hover:bg-emerald-700'
+                                    : 'text-emerald-700 bg-emerald-50 hover:bg-emerald-100'
+                                }`}
+                              >
+                                <Highlighter className="w-3.5 h-3.5" />
+                                <span>
+                                  {isExactSubject
+                                    ? 'Quitar asignatura'
+                                    : 'Marcar asignatura en verde'}
+                                </span>
+                              </button>
+                            </div>
+                          </div>
+                        );
+                      })}
+                    </div>
+                  </div>
+
+                  {/* Right: Full Daily Schedule of the Occupying Professor */}
+                  <div className="xl:col-span-6 space-y-3">
+                    <div className="flex flex-wrap items-center justify-between gap-2">
+                      <h3 className="text-xs font-semibold text-slate-500">
+                        Horario completo del profesor hoy ({webUntisDateHeader})
+                      </h3>
+                      {cellTeachers.length > 1 && (
+                        <div className="flex items-center gap-1 bg-slate-200/70 p-0.5 rounded-lg">
+                          {cellTeachers.map((t) => (
+                            <button
+                              key={t.id}
+                              type="button"
+                              onClick={() => setSelectedTeacherId(t.id)}
+                              className={`px-2 py-1 text-[11px] font-medium rounded-md transition-colors whitespace-nowrap cursor-pointer ${
+                                selectedTeacherId === t.id
+                                  ? 'bg-white text-slate-900 shadow-xs'
+                                  : 'text-slate-600 hover:text-slate-900'
                               }`}
                             >
-                              {detail.startLabel} – {detail.endLabel}
+                              {t.fullName}
+                            </button>
+                          ))}
+                        </div>
+                      )}
+                    </div>
+
+                    <div className="bg-white border border-slate-200 rounded-xl p-3.5">
+                      {cellTeachers.length === 0 ? (
+                        <p className="text-xs text-slate-500 py-2">
+                          Esta reserva no tiene un profesor asignado en
+                          WebUntis.
+                        </p>
+                      ) : teacherLoading ? (
+                        <div className="space-y-2 py-1">
+                          <div className="h-4 w-44 bg-slate-100 rounded animate-pulse" />
+                          <div className="h-9 w-full bg-slate-100 rounded animate-pulse" />
+                          <div className="h-9 w-full bg-slate-100 rounded animate-pulse" />
+                        </div>
+                      ) : teacherError ? (
+                        <p className="text-xs text-red-700 py-2">
+                          {teacherError}
+                        </p>
+                      ) : teacherSchedule ? (
+                        <div className="space-y-2.5">
+                          <div className="flex flex-wrap items-baseline justify-between gap-2 pb-2 border-b border-slate-100">
+                            <div className="text-xs">
+                              <span className="font-semibold text-slate-900">
+                                {teacherSchedule.teacher.fullName}
+                              </span>
+                              {teacherSchedule.teacher.code !==
+                                teacherSchedule.teacher.fullName && (
+                                <span className="ml-1.5 font-mono text-[11px] text-slate-500">
+                                  {teacherSchedule.teacher.code}
+                                </span>
+                              )}
+                            </div>
+                            <span className="text-[11px] font-mono tabular-nums text-slate-500">
+                              {teacherSchedule.sessions.length}{' '}
+                              {teacherSchedule.sessions.length === 1
+                                ? 'sesión hoy'
+                                : 'sesiones hoy'}
                             </span>
                           </div>
 
-                          <div className="flex flex-wrap items-center gap-x-4 gap-y-1.5 pt-1 text-xs text-slate-600">
-                            {detail.teachers.length > 0 && (
-                              <span className="inline-flex items-center gap-1.5">
-                                <User className="w-3.5 h-3.5 text-slate-400 shrink-0" />
-                                <span>{detail.teachers.join(', ')}</span>
-                              </span>
-                            )}
-                            {detail.groups.length > 0 && (
-                              <span className="inline-flex items-center gap-1.5">
-                                <GraduationCap className="w-3.5 h-3.5 text-slate-400 shrink-0" />
-                                <span>{detail.groups.join(', ')}</span>
-                              </span>
-                            )}
-                            {detail.lessonText &&
-                              detail.lessonText !== detail.subject && (
-                                <span className="text-slate-500">
-                                  {detail.lessonText}
-                                </span>
-                              )}
-                            {detail.isExam && (
-                              <span className="font-semibold text-red-800">
-                                Examen
-                              </span>
-                            )}
-                          </div>
-
-                          {(detail.periodText || detail.substText) && (
-                            <p className="text-xs text-slate-500 pt-0.5">
-                              {[detail.periodText, detail.substText]
-                                .filter(Boolean)
-                                .join(' · ')}
+                          {teacherSchedule.sessions.length === 0 ? (
+                            <p className="text-xs text-slate-500 py-1">
+                              Sin otras sesiones registradas hoy para este
+                              docente.
                             </p>
+                          ) : (
+                            <ul className="space-y-1.5 max-h-[210px] overflow-y-auto pr-1">
+                              {teacherSchedule.sessions.map((session) => {
+                                const slotTime =
+                                  TIME_SLOTS[selectedCell.slotIndex].startTime;
+                                const isCurrentSession =
+                                  session.rooms.includes(
+                                    selectedCell.room.name
+                                  ) &&
+                                  session.startTime <= slotTime &&
+                                  session.endTime > slotTime;
+                                return (
+                                  <li
+                                    key={`${session.id}-${session.startTime}`}
+                                    className={`px-3 py-2 rounded-lg border text-xs transition-colors ${
+                                      isCurrentSession
+                                        ? 'bg-red-50/80 border-red-200'
+                                        : 'bg-slate-50/70 border-slate-200/70'
+                                    }`}
+                                  >
+                                    <div className="flex items-start justify-between gap-3">
+                                      <div className="min-w-0">
+                                        <p className="font-semibold text-slate-900 leading-snug">
+                                          {session.subject}
+                                        </p>
+                                        <div className="flex flex-wrap items-center gap-x-2 gap-y-0.5 text-[11px] text-slate-600 mt-0.5">
+                                          {session.rooms.length > 0 && (
+                                            <span className="inline-flex items-center gap-1 font-mono font-medium text-slate-700">
+                                              <MapPin className="w-3 h-3 text-slate-400" />
+                                              {session.rooms.join(', ')}
+                                            </span>
+                                          )}
+                                          {session.groups.length > 0 && (
+                                            <>
+                                              <span
+                                                className="text-slate-300"
+                                                aria-hidden="true"
+                                              >
+                                                ·
+                                              </span>
+                                              <span className="truncate max-w-[230px]">
+                                                {session.groups.join(', ')}
+                                              </span>
+                                            </>
+                                          )}
+                                        </div>
+                                      </div>
+                                      <span className="font-mono tabular-nums font-medium text-slate-800 whitespace-nowrap shrink-0">
+                                        {session.startLabel}–{session.endLabel}
+                                      </span>
+                                    </div>
+                                  </li>
+                                );
+                              })}
+                            </ul>
                           )}
-
-                          <div className="pt-1.5 border-t border-slate-100 flex justify-end">
-                            <button
-                              type="button"
-                              onClick={() =>
-                                onSelectSubject(
-                                  isExactSelected ? '' : detail.subject
-                                )
-                              }
-                              className={`inline-flex items-center gap-1.5 px-2.5 py-1 text-xs font-medium rounded-lg transition-colors cursor-pointer whitespace-nowrap ${
-                                isExactSelected
-                                  ? 'bg-emerald-600 text-white hover:bg-emerald-700'
-                                  : 'text-emerald-700 bg-emerald-50 hover:bg-emerald-100'
-                              }`}
-                            >
-                              <Highlighter className="w-3.5 h-3.5" />
-                              <span>
-                                {isExactSelected
-                                  ? 'Quitar resaltado verde'
-                                  : 'Marcar asignatura en verde'}
-                              </span>
-                            </button>
-                          </div>
                         </div>
-                      );
-                    })}
+                      ) : null}
+                    </div>
                   </div>
                 </div>
               ) : (
@@ -401,7 +713,7 @@ export function TimetableGrid({
               <th
                 rowSpan={2}
                 scope="col"
-                className={`timetable-room-col sticky left-0 z-20 bg-slate-50 border-r border-b border-slate-300 px-3 py-2 text-left text-xs font-semibold text-slate-700 align-middle`}
+                className="timetable-room-col sticky left-0 z-20 bg-slate-50 border-r border-b border-slate-300 px-3 py-2 text-left text-xs font-semibold text-slate-700 align-middle"
               >
                 {grid.isSpecial ? 'Espacios' : 'Aulas'}
               </th>
@@ -447,6 +759,11 @@ export function TimetableGrid({
                 room.periods.some((p) =>
                   matchesSubjectPeriod(p, normalizedSubject)
                 );
+              const roomMatchesTeacher =
+                normalizedTeacher.length > 0 &&
+                room.periods.some((p) =>
+                  matchesTeacherPeriod(p, normalizedTeacher)
+                );
               return (
                 <tr
                   key={`${grid.id}-${room.name}`}
@@ -455,7 +772,9 @@ export function TimetableGrid({
                       ? 'bg-red-50/30'
                       : roomMatchesSubject
                         ? 'bg-emerald-50/30 hover:bg-emerald-50/60'
-                        : 'hover:bg-slate-50/70'
+                        : roomMatchesTeacher
+                          ? 'bg-blue-50/30 hover:bg-blue-50/60'
+                          : 'hover:bg-slate-50/70'
                   }`}
                 >
                   <th
@@ -470,7 +789,9 @@ export function TimetableGrid({
                         ? 'bg-red-50/60 text-slate-950 font-semibold'
                         : roomMatchesSubject
                           ? 'bg-emerald-50/90 text-emerald-900 font-semibold'
-                          : 'bg-white group-hover:bg-slate-50 text-slate-700'
+                          : roomMatchesTeacher
+                            ? 'bg-blue-50/90 text-blue-900 font-semibold'
+                            : 'bg-white group-hover:bg-slate-50 text-slate-700'
                     }`}
                   >
                     <div className="flex items-center justify-between gap-2">
@@ -494,6 +815,12 @@ export function TimetableGrid({
                       details.some((d) =>
                         matchesSubjectPeriod(d, normalizedSubject)
                       );
+                    const isTeacherMatch =
+                      normalizedTeacher.length > 0 &&
+                      occupied &&
+                      details.some((d) =>
+                        matchesTeacherPeriod(d, normalizedTeacher)
+                      );
                     const isSelected =
                       selectedCell?.room.name === room.name &&
                       selectedCell?.slotIndex === slot.index;
@@ -514,15 +841,17 @@ export function TimetableGrid({
 
                     const cellColorClass = isSubjectMatch
                       ? 'timetable-slot-subject-match bg-emerald-600 hover:bg-emerald-700 border-emerald-700/40'
-                      : occupied
-                        ? normalizedSubject.length > 0
-                          ? 'timetable-slot-occupied bg-red-500/45 hover:bg-red-600/75 border-red-400/40'
-                          : 'timetable-slot-occupied bg-red-600 hover:bg-red-700 border-red-700/35'
-                        : isHighlighted
-                          ? 'timetable-slot-free bg-emerald-50/70 hover:bg-emerald-100/70 border-slate-200'
-                          : isNow
-                            ? 'timetable-slot-free bg-amber-50/50 hover:bg-amber-100/60 border-slate-200'
-                            : 'timetable-slot-free bg-white hover:bg-slate-100 border-slate-200';
+                      : isTeacherMatch
+                        ? 'timetable-slot-teacher-match bg-blue-600 hover:bg-blue-700 border-blue-700/40'
+                        : occupied
+                          ? hasActiveSearchHighlight
+                            ? 'timetable-slot-occupied bg-red-500/45 hover:bg-red-600/75 border-red-400/40'
+                            : 'timetable-slot-occupied bg-red-600 hover:bg-red-700 border-red-700/35'
+                          : isHighlighted
+                            ? 'timetable-slot-free bg-emerald-50/70 hover:bg-emerald-100/70 border-slate-200'
+                            : isNow
+                              ? 'timetable-slot-free bg-amber-50/50 hover:bg-amber-100/60 border-slate-200'
+                              : 'timetable-slot-free bg-white hover:bg-slate-100 border-slate-200';
 
                     return (
                       <td
@@ -562,6 +891,12 @@ export function TimetableGrid({
             <span className="inline-flex items-center gap-1.5">
               <span className="inline-block w-3 h-2.5 bg-emerald-600 border border-emerald-700 timetable-slot-subject-match" />
               Asignatura buscada
+            </span>
+          )}
+          {normalizedTeacher.length > 0 && (
+            <span className="inline-flex items-center gap-1.5">
+              <span className="inline-block w-3 h-2.5 bg-blue-600 border border-blue-700 timetable-slot-teacher-match" />
+              Profesorado buscado
             </span>
           )}
           <span className="inline-flex items-center gap-1.5">

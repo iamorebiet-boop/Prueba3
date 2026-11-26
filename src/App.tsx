@@ -5,12 +5,20 @@ import {
   CheckCircle2,
   ChevronLeft,
   ChevronRight,
+  FileSpreadsheet,
+  Layers,
   Printer,
   RefreshCw,
+  User,
   X,
 } from 'lucide-react';
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { CalendarSidebar } from './components/CalendarSidebar';
+import {
+  PrintCenterModal,
+  type PrintJobConfig,
+} from './components/PrintCenterModal';
+import { PrintSheet } from './components/PrintSheet';
 import { TimetableGrid } from './components/TimetableGrid';
 import {
   ALL_UNIQUE_ROOM_NAMES,
@@ -21,6 +29,7 @@ import {
 import type {
   DayTimetableResponse,
   GridDaySchedule,
+  PeriodDetail,
   RoomGroupId,
 } from './data/roomGroups';
 import {
@@ -49,6 +58,39 @@ function getInitialDateFromUrl(fallbackIso: string): string {
   return fallbackIso;
 }
 
+function detailMatchesTeacherQuery(
+  detail: PeriodDetail,
+  normalizedTeacher: string
+): boolean {
+  if (!normalizedTeacher) return false;
+  if (
+    detail.teachers.some((t) =>
+      normalizeSearchText(t).includes(normalizedTeacher)
+    )
+  ) {
+    return true;
+  }
+  return (detail.teacherDetails ?? []).some(
+    (t) =>
+      normalizeSearchText(t.fullName).includes(normalizedTeacher) ||
+      normalizeSearchText(t.code).includes(normalizedTeacher)
+  );
+}
+
+function detailMatchesSubjectQuery(
+  detail: PeriodDetail,
+  normalizedSubject: string
+): boolean {
+  if (!normalizedSubject) return false;
+  return (
+    normalizeSearchText(detail.subject).includes(normalizedSubject) ||
+    normalizeSearchText(detail.subjectAlt).includes(normalizedSubject) ||
+    detail.groups.some((gr) =>
+      normalizeSearchText(gr).includes(normalizedSubject)
+    )
+  );
+}
+
 export default function App() {
   const [todayIso, setTodayIso] = useState<string>(() => getTodayMadridISO());
   const [selectedDate, setSelectedDate] = useState<string>(() =>
@@ -57,9 +99,16 @@ export default function App() {
   const [activeGrid, setActiveGrid] = useState<ActiveGridFilter>('ALL');
   const [roomQuery, setRoomQuery] = useState<string>('');
   const [subjectQuery, setSubjectQuery] = useState<string>('');
+  const [teacherQuery, setTeacherQuery] = useState<string>('');
   const [freeAtSlot, setFreeAtSlot] = useState<number | null>(null);
   const [autoRefresh, setAutoRefresh] = useState<boolean>(true);
   const [mobileCalendarOpen, setMobileCalendarOpen] = useState<boolean>(false);
+
+  const [printModalOpen, setPrintModalOpen] = useState<boolean>(false);
+  const [printModalTab, setPrintModalTab] = useState<'grids' | 'summary'>(
+    'grids'
+  );
+  const [printJob, setPrintJob] = useState<PrintJobConfig | null>(null);
 
   const [timetable, setTimetable] = useState<DayTimetableResponse | null>(null);
   const [isLoading, setIsLoading] = useState<boolean>(true);
@@ -177,32 +226,37 @@ export default function App() {
     return () => window.removeEventListener('keydown', handleKeyDown);
   }, []);
 
-  const triggerPrint = useCallback((target: 'ALL' | RoomGroupId) => {
-    document.body.setAttribute('data-print-target', target);
+  const executePrintJob = useCallback((config: PrintJobConfig) => {
+    setPrintModalOpen(false);
+    setPrintJob(config);
+    document.body.setAttribute('data-print-mode', 'custom');
+
     const cleanup = () => {
-      document.body.removeAttribute('data-print-target');
+      document.body.removeAttribute('data-print-mode');
+      setPrintJob(null);
       window.removeEventListener('afterprint', cleanup);
     };
     window.addEventListener('afterprint', cleanup);
+
     window.setTimeout(() => {
       window.print();
-    }, 60);
+    }, 80);
   }, []);
 
-  const handlePrintAll = useCallback(() => {
-    if (activeGrid !== 'ALL') {
-      setActiveGrid('ALL');
-      window.setTimeout(() => triggerPrint('ALL'), 100);
-    } else {
-      triggerPrint('ALL');
-    }
-  }, [activeGrid, triggerPrint]);
+  const openPrintModal = useCallback((tab: 'grids' | 'summary') => {
+    setPrintModalTab(tab);
+    setPrintModalOpen(true);
+  }, []);
 
   const handlePrintGrid = useCallback(
     (gridId: RoomGroupId) => {
-      triggerPrint(gridId);
+      executePrintJob({
+        mode: 'grids',
+        gridIds: [gridId],
+        pageBreak: false,
+      });
     },
-    [triggerPrint]
+    [executePrintJob]
   );
 
   // Monday–Saturday week strip with live crimson occupancy bars
@@ -236,21 +290,43 @@ export default function App() {
     () => normalizeSearchText(subjectQuery),
     [subjectQuery]
   );
+  const normalizedTeacher = useMemo(
+    () => normalizeSearchText(teacherQuery),
+    [teacherQuery]
+  );
 
-  // Unique scheduled subject names for the selected day (autocomplete datalist)
-  const availableSubjects = useMemo(() => {
-    if (!timetable) return [];
-    const set = new Set<string>();
+  // Unique scheduled subject names and teachers for the selected day (autocomplete datalists)
+  const { availableSubjects, availableTeachers } = useMemo(() => {
+    if (!timetable) {
+      return {
+        availableSubjects: [] as string[],
+        availableTeachers: [] as string[],
+      };
+    }
+    const subjSet = new Set<string>();
+    const teachSet = new Set<string>();
     for (const g of timetable.grids) {
       for (const r of g.rooms) {
         for (const p of r.periods) {
           if (p.subject && p.subject.trim().length > 0) {
-            set.add(p.subject.trim());
+            subjSet.add(p.subject.trim());
+          }
+          for (const t of p.teachers ?? []) {
+            if (t && t.trim().length > 0) {
+              teachSet.add(t.trim());
+            }
           }
         }
       }
     }
-    return Array.from(set).sort((a, b) => a.localeCompare(b, 'es'));
+    return {
+      availableSubjects: Array.from(subjSet).sort((a, b) =>
+        a.localeCompare(b, 'es')
+      ),
+      availableTeachers: Array.from(teachSet).sort((a, b) =>
+        a.localeCompare(b, 'es')
+      ),
+    };
   }, [timetable]);
 
   const filteredGrids: GridDaySchedule[] = useMemo(() => {
@@ -272,15 +348,16 @@ export default function App() {
             return false;
           }
           if (normalizedSubject.length > 0) {
-            const hasMatchingSubject = r.periods.some(
-              (p) =>
-                normalizeSearchText(p.subject).includes(normalizedSubject) ||
-                normalizeSearchText(p.subjectAlt).includes(normalizedSubject) ||
-                p.groups.some((gr) =>
-                  normalizeSearchText(gr).includes(normalizedSubject)
-                )
+            const hasMatchingSubject = r.periods.some((p) =>
+              detailMatchesSubjectQuery(p, normalizedSubject)
             );
             if (!hasMatchingSubject) return false;
+          }
+          if (normalizedTeacher.length > 0) {
+            const hasMatchingTeacher = r.periods.some((p) =>
+              detailMatchesTeacherQuery(p, normalizedTeacher)
+            );
+            if (!hasMatchingTeacher) return false;
           }
           return true;
         });
@@ -305,38 +382,61 @@ export default function App() {
         };
       })
       .filter((g) => g.rooms.length > 0);
-  }, [timetable, activeGrid, roomQuery, freeAtSlot, normalizedSubject]);
+  }, [
+    timetable,
+    activeGrid,
+    roomQuery,
+    freeAtSlot,
+    normalizedSubject,
+    normalizedTeacher,
+  ]);
 
-  const subjectMatchSummary = useMemo(() => {
-    if (normalizedSubject.length === 0) return null;
-    let matchingSlots = 0;
+  const searchMatchSummary = useMemo(() => {
+    if (normalizedSubject.length === 0 && normalizedTeacher.length === 0) {
+      return null;
+    }
+    let subjectSlots = 0;
+    let teacherSlots = 0;
     const matchedRoomNames = new Set<string>();
     for (const g of filteredGrids) {
       for (const r of g.rooms) {
         if (matchedRoomNames.has(r.name)) continue;
-        let roomHits = 0;
+        let roomHasHit = false;
         for (const slot of TIME_SLOTS) {
           if (r.slots[slot.index] === 'free') continue;
-          const hit = r.periods.some(
-            (p) =>
-              p.startTime < slot.endTime &&
-              p.endTime > slot.startTime &&
-              (normalizeSearchText(p.subject).includes(normalizedSubject) ||
-                normalizeSearchText(p.subjectAlt).includes(normalizedSubject) ||
-                p.groups.some((gr) =>
-                  normalizeSearchText(gr).includes(normalizedSubject)
-                ))
+          const slotPeriods = r.periods.filter(
+            (p) => p.startTime < slot.endTime && p.endTime > slot.startTime
           );
-          if (hit) roomHits += 1;
+          const subjHit =
+            normalizedSubject.length > 0 &&
+            slotPeriods.some((p) =>
+              detailMatchesSubjectQuery(p, normalizedSubject)
+            );
+          const teachHit =
+            normalizedTeacher.length > 0 &&
+            slotPeriods.some((p) =>
+              detailMatchesTeacherQuery(p, normalizedTeacher)
+            );
+          if (subjHit) {
+            subjectSlots += 1;
+            roomHasHit = true;
+          }
+          if (teachHit) {
+            teacherSlots += 1;
+            roomHasHit = true;
+          }
         }
-        if (roomHits > 0) {
+        if (roomHasHit) {
           matchedRoomNames.add(r.name);
-          matchingSlots += roomHits;
         }
       }
     }
-    return { matchingSlots, matchingRooms: matchedRoomNames.size };
-  }, [filteredGrids, normalizedSubject]);
+    return {
+      subjectSlots,
+      teacherSlots,
+      matchingRooms: matchedRoomNames.size,
+    };
+  }, [filteredGrids, normalizedSubject, normalizedTeacher]);
 
   const totals = useMemo(() => {
     const seen = new Set<string>();
@@ -366,538 +466,653 @@ export default function App() {
     `https://ehu.webuntis.com/WebUntis/?date=${encodeURIComponent(selectedDate)}#/basic/timetablePublic`;
 
   return (
-    <div className="min-h-screen flex flex-col bg-[#f3f5f8] text-slate-900">
-      {/* Strict 3-Zone Top Bar matching reference format */}
-      <header className="no-print sticky top-0 z-30 bg-white/95 backdrop-blur-sm border-b border-slate-200/90">
-        <div className="max-w-[1440px] mx-auto px-4 sm:px-6 h-14 flex items-center justify-between gap-8">
-          {/* Zone 1: Single-line Brand Wordmark */}
-          <a
-            href="/"
-            onClick={(e) => {
-              e.preventDefault();
-              setActiveGrid('ALL');
-              setRoomQuery('');
-              setSubjectQuery('');
-              setFreeAtSlot(null);
-            }}
-            className="font-display text-base font-bold tracking-tight text-slate-900 whitespace-nowrap shrink-0"
-          >
-            Ingeniería 306
-          </a>
-
-          {/* Zone 2: Concise single-line section links */}
-          <nav
-            aria-label="Navegación por secciones"
-            className="hidden md:flex items-center gap-6 text-sm font-medium"
-          >
-            {ROOM_GROUPS.map((g) => {
-              const active = activeGrid === g.id;
-              return (
-                <button
-                  key={g.id}
-                  type="button"
-                  onClick={() =>
-                    setActiveGrid((prev) => (prev === g.id ? 'ALL' : g.id))
-                  }
-                  className={`py-1 border-b-2 transition-colors whitespace-nowrap shrink-0 cursor-pointer ${
-                    active
-                      ? 'border-red-600 text-slate-950 font-semibold'
-                      : 'border-transparent text-slate-500 hover:text-slate-900'
-                  }`}
-                >
-                  {g.isSpecial ? 'Especiales' : g.shortLabel}
-                </button>
-              );
-            })}
-          </nav>
-
-          {/* Zone 3: Single Primary Action */}
-          <div className="flex items-center shrink-0">
-            <button
-              type="button"
-              onClick={handlePrintAll}
-              disabled={!timetable || isLoading}
-              className="inline-flex items-center gap-2 px-4 py-2 text-xs font-medium text-white bg-slate-900 hover:bg-slate-800 disabled:opacity-50 rounded-lg transition-colors whitespace-nowrap shrink-0 cursor-pointer"
+    <>
+      <div className="screen-app-shell min-h-screen flex flex-col bg-[#f3f5f8] text-slate-900">
+        {/* Strict 3-Zone Top Bar */}
+        <header className="no-print sticky top-0 z-30 bg-white/95 backdrop-blur-sm border-b border-slate-200/90">
+          <div className="max-w-[1440px] mx-auto px-4 sm:px-6 h-14 flex items-center justify-between gap-8">
+            {/* Zone 1: Single-line Brand Wordmark */}
+            <a
+              href="/"
+              onClick={(e) => {
+                e.preventDefault();
+                setActiveGrid('ALL');
+                setRoomQuery('');
+                setSubjectQuery('');
+                setTeacherQuery('');
+                setFreeAtSlot(null);
+              }}
+              className="font-display text-base font-bold tracking-tight text-slate-900 whitespace-nowrap shrink-0"
             >
-              <Printer className="w-3.5 h-3.5" />
-              <span>Imprimir todo</span>
-            </button>
-          </div>
-        </div>
-      </header>
+              Ingeniería 306
+            </a>
 
-      {/* Main Workspace */}
-      <div className="flex-1 max-w-[1440px] w-full mx-auto px-4 sm:px-6 py-6 flex flex-col lg:flex-row items-start gap-6">
-        {/* Mobile Calendar Toggle */}
-        <div className="no-print w-full lg:hidden flex items-center justify-between gap-3">
-          <button
-            type="button"
-            onClick={() => setMobileCalendarOpen((v) => !v)}
-            className="inline-flex items-center gap-2 px-3.5 py-2 text-xs font-medium text-slate-800 bg-white border border-slate-200 rounded-lg cursor-pointer shrink-0"
-          >
-            <CalendarDays className="w-4 h-4 text-slate-500" />
-            <span>
-              {mobileCalendarOpen
-                ? 'Ocultar calendario'
-                : 'Calendario y filtros'}
-            </span>
-          </button>
-          <div className="flex items-center gap-1 overflow-x-auto">
-            <button
-              type="button"
-              onClick={() => setActiveGrid('ALL')}
-              className={`px-2.5 py-1.5 text-xs font-medium rounded-lg whitespace-nowrap shrink-0 cursor-pointer ${
-                activeGrid === 'ALL'
-                  ? 'bg-red-600 text-white'
-                  : 'bg-white border border-slate-200 text-slate-600'
-              }`}
+            {/* Zone 2: Concise single-line section links */}
+            <nav
+              aria-label="Navegación por secciones"
+              className="hidden md:flex items-center gap-6 text-sm font-medium"
             >
-              Todos
-            </button>
-            {ROOM_GROUPS.map((g) => (
+              {ROOM_GROUPS.map((g) => {
+                const active = activeGrid === g.id;
+                return (
+                  <button
+                    key={g.id}
+                    type="button"
+                    onClick={() =>
+                      setActiveGrid((prev) => (prev === g.id ? 'ALL' : g.id))
+                    }
+                    className={`py-1 border-b-2 transition-colors whitespace-nowrap shrink-0 cursor-pointer ${
+                      active
+                        ? 'border-red-600 text-slate-950 font-semibold'
+                        : 'border-transparent text-slate-500 hover:text-slate-900'
+                    }`}
+                  >
+                    {g.isSpecial ? 'Especiales' : g.shortLabel}
+                  </button>
+                );
+              })}
+            </nav>
+
+            {/* Zone 3: Single Primary Action */}
+            <div className="flex items-center shrink-0">
               <button
-                key={g.id}
                 type="button"
-                onClick={() => setActiveGrid(g.id)}
+                onClick={() => openPrintModal('grids')}
+                disabled={!timetable || isLoading}
+                className="inline-flex items-center gap-2 px-4 py-2 text-xs font-medium text-white bg-slate-900 hover:bg-slate-800 disabled:opacity-50 rounded-lg transition-colors whitespace-nowrap shrink-0 cursor-pointer"
+              >
+                <Printer className="w-3.5 h-3.5" />
+                <span>Imprimir</span>
+              </button>
+            </div>
+          </div>
+        </header>
+
+        {/* Main Workspace */}
+        <div className="flex-1 max-w-[1440px] w-full mx-auto px-4 sm:px-6 py-6 flex flex-col lg:flex-row items-start gap-6">
+          {/* Mobile Calendar Toggle */}
+          <div className="no-print w-full lg:hidden flex items-center justify-between gap-3">
+            <button
+              type="button"
+              onClick={() => setMobileCalendarOpen((v) => !v)}
+              className="inline-flex items-center gap-2 px-3.5 py-2 text-xs font-medium text-slate-800 bg-white border border-slate-200 rounded-lg cursor-pointer shrink-0"
+            >
+              <CalendarDays className="w-4 h-4 text-slate-500" />
+              <span>
+                {mobileCalendarOpen
+                  ? 'Ocultar calendario'
+                  : 'Calendario y filtros'}
+              </span>
+            </button>
+            <div className="flex items-center gap-1 overflow-x-auto">
+              <button
+                type="button"
+                onClick={() => setActiveGrid('ALL')}
                 className={`px-2.5 py-1.5 text-xs font-medium rounded-lg whitespace-nowrap shrink-0 cursor-pointer ${
-                  activeGrid === g.id
+                  activeGrid === 'ALL'
                     ? 'bg-red-600 text-white'
                     : 'bg-white border border-slate-200 text-slate-600'
                 }`}
               >
-                {g.shortLabel}
+                Todos
               </button>
-            ))}
-          </div>
-        </div>
-
-        {/* Intuitive Calendar & Filters Sidebar */}
-        <div
-          className={`no-print w-full lg:w-auto ${
-            mobileCalendarOpen ? 'block' : 'hidden lg:block'
-          }`}
-        >
-          <CalendarSidebar
-            selectedDate={selectedDate}
-            todayIso={todayIso}
-            onSelectDate={(iso) => {
-              setSelectedDate(iso);
-              setMobileCalendarOpen(false);
-            }}
-            roomQuery={roomQuery}
-            onRoomQueryChange={setRoomQuery}
-            freeAtSlot={freeAtSlot}
-            onFreeAtSlotChange={setFreeAtSlot}
-            currentSlotIndex={currentSlotIndex}
-            autoRefresh={autoRefresh}
-            onToggleAutoRefresh={() => setAutoRefresh((v) => !v)}
-            onManualRefresh={() => fetchTimetable(selectedDate, true)}
-            isLoading={isLoading}
-            fetchedAt={timetable?.lastUpdated ?? null}
-            lastImportTimestamp={timetable?.lastImportTimestamp ?? null}
-            webUntisDirectUrl={webUntisDirectUrl}
-          />
-        </div>
-
-        {/* Main Content Viewport */}
-        <main className="flex-1 min-w-0 w-full space-y-5">
-          {/* Architectural Deep-Slate Date Hero & Week Strip */}
-          <section className="no-print bg-slate-900 text-white rounded-2xl p-5 sm:p-6 shadow-[0_6px_24px_rgba(15,23,42,0.12)] space-y-5">
-            <div className="flex flex-wrap items-start justify-between gap-4">
-              <div className="min-w-0">
-                <p className="text-xs text-slate-400 tracking-wide">
-                  {SCHOOL_INFO.university} · {SCHOOL_INFO.name} · Centro{' '}
-                  {SCHOOL_INFO.centerCode}
-                </p>
-                <h1 className="text-2xl sm:text-[28px] font-bold text-white tracking-tight mt-1 [text-wrap:balance]">
-                  {fullDateLabel}
-                </h1>
-              </div>
-
-              <div className="flex flex-wrap items-center gap-1.5 shrink-0">
-                <button
-                  type="button"
-                  onClick={() => fetchTimetable(selectedDate, true)}
-                  disabled={isLoading}
-                  title="Sincronizar ahora con ehu.webuntis.com"
-                  className="inline-flex items-center gap-1.5 px-3 py-1.5 text-xs font-medium text-white bg-red-600 hover:bg-red-700 disabled:opacity-60 rounded-lg transition-colors whitespace-nowrap cursor-pointer"
-                >
-                  <RefreshCw
-                    className={`w-3.5 h-3.5 ${isLoading ? 'animate-spin' : ''}`}
-                  />
-                  <span>{isLoading ? 'Actualizando...' : 'Actualizar'}</span>
-                </button>
-                <button
-                  type="button"
-                  onClick={() => setSelectedDate((d) => addDays(d, -1))}
-                  aria-label="Día anterior"
-                  title="Día anterior (Flecha izquierda)"
-                  className="inline-flex items-center gap-1 px-3 py-1.5 text-xs font-medium text-slate-200 bg-white/10 hover:bg-white/15 border border-white/10 rounded-lg transition-colors whitespace-nowrap cursor-pointer"
-                >
-                  <ChevronLeft className="w-4 h-4" />
-                  <span className="hidden sm:inline">Anterior</span>
-                </button>
-                <button
-                  type="button"
-                  onClick={() => setSelectedDate(todayIso)}
-                  className="px-3.5 py-1.5 text-xs font-medium text-slate-900 bg-white hover:bg-slate-100 rounded-lg transition-colors whitespace-nowrap cursor-pointer"
-                >
-                  Hoy
-                </button>
-                <button
-                  type="button"
-                  onClick={() => setSelectedDate((d) => addDays(d, 1))}
-                  aria-label="Día siguiente"
-                  title="Día siguiente (Flecha derecha)"
-                  className="inline-flex items-center gap-1 px-3 py-1.5 text-xs font-medium text-slate-200 bg-white/10 hover:bg-white/15 border border-white/10 rounded-lg transition-colors whitespace-nowrap cursor-pointer"
-                >
-                  <span className="hidden sm:inline">Siguiente</span>
-                  <ChevronRight className="w-4 h-4" />
-                </button>
-              </div>
-            </div>
-
-            {/* Interactive Monday-Saturday Week Strip with Crimson Occupancy Bars */}
-            <div
-              role="tablist"
-              aria-label="Días de la semana"
-              className="grid grid-cols-3 sm:grid-cols-6 gap-2"
-            >
-              {weekDays.map((day) => {
-                const isSelected = day.iso === selectedDate;
-                const isToday = day.iso === todayIso;
-                return (
-                  <button
-                    key={day.iso}
-                    type="button"
-                    role="tab"
-                    aria-selected={isSelected}
-                    onClick={() => setSelectedDate(day.iso)}
-                    className={`px-3 py-2.5 rounded-xl text-left transition-all cursor-pointer border ${
-                      isSelected
-                        ? 'bg-white text-slate-900 border-white shadow-sm'
-                        : 'bg-white/[0.06] text-slate-200 border-white/10 hover:bg-white/[0.11]'
-                    }`}
-                  >
-                    <div className="flex items-baseline justify-between gap-1">
-                      <span className="text-xs font-semibold">
-                        {day.shortDay}{' '}
-                        <span className="font-mono tabular-nums">
-                          {day.dayNum}
-                        </span>
-                      </span>
-                      {isToday && (
-                        <span
-                          className={`text-[10px] font-semibold ${
-                            isSelected ? 'text-red-600' : 'text-red-400'
-                          }`}
-                        >
-                          Hoy
-                        </span>
-                      )}
-                    </div>
-                    <div
-                      className={`text-[11px] font-mono tabular-nums mt-0.5 truncate ${
-                        isSelected ? 'text-slate-500' : 'text-slate-400'
-                      }`}
-                    >
-                      {day.activeRooms !== null
-                        ? `${day.activeRooms} activos`
-                        : '—'}
-                    </div>
-                    <div
-                      className={`mt-2 h-1 w-full rounded-full overflow-hidden ${
-                        isSelected ? 'bg-slate-200' : 'bg-white/15'
-                      }`}
-                    >
-                      <div
-                        className="h-full bg-red-600 rounded-full transition-all duration-300"
-                        style={{ width: `${day.pct}%` }}
-                      />
-                    </div>
-                  </button>
-                );
-              })}
-            </div>
-
-            {/* Quiet Unboxed Summary & Legend */}
-            <div className="flex flex-wrap items-center justify-between gap-3 pt-1 border-t border-white/10 text-xs text-slate-300">
-              <div className="flex flex-wrap items-center gap-2 tabular-nums">
-                <span className="font-semibold text-white">
-                  {totals.roomCount}{' '}
-                  {totals.roomCount === 1
-                    ? 'espacio visible'
-                    : 'espacios visibles'}
-                </span>
-                <span className="text-white/30" aria-hidden="true">
-                  ·
-                </span>
-                <span>{totals.occupiedSlots} franjas ocupadas</span>
-                <span className="text-white/30" aria-hidden="true">
-                  ·
-                </span>
-                <span>{totals.pct}% ocupación diaria</span>
-                {timetable && !errorMsg && (
-                  <>
-                    <span className="text-white/30" aria-hidden="true">
-                      ·
-                    </span>
-                    <span className="inline-flex items-center gap-1 text-emerald-300 font-mono">
-                      <CheckCircle2 className="w-3.5 h-3.5" />
-                      {timetable.syncedRooms}/{timetable.totalRooms} WebUntis{' '}
-                      {formatSyncTime(timetable.lastUpdated)}
-                    </span>
-                  </>
-                )}
-              </div>
-
-              <div className="flex items-center gap-4 text-xs">
-                {normalizedSubject.length > 0 && (
-                  <span className="inline-flex items-center gap-1.5 text-emerald-300">
-                    <span className="inline-block w-3.5 h-3 rounded-[2px] bg-emerald-600 ring-1 ring-emerald-400/60" />
-                    Asignatura buscada
-                  </span>
-                )}
-                <span className="inline-flex items-center gap-1.5 text-slate-200">
-                  <span className="inline-block w-3.5 h-3 rounded-[2px] bg-red-600 ring-1 ring-red-400/50" />
-                  Ocupada
-                </span>
-                <span className="inline-flex items-center gap-1.5 text-slate-200">
-                  <span className="inline-block w-3.5 h-3 rounded-[2px] bg-white border border-slate-400" />
-                  Libre
-                </span>
-              </div>
-            </div>
-          </section>
-
-          {/* Dedicated Subject Search Bar (Highlights matching hours in green) */}
-          <section
-            aria-label="Buscador por nombre de asignatura"
-            className="no-print bg-white border border-slate-200/90 rounded-2xl shadow-[0_1px_3px_rgba(15,23,42,0.04)] px-4 py-3 flex flex-col sm:flex-row sm:items-center gap-3"
-          >
-            <div className="relative flex-1 min-w-0">
-              <BookOpen
-                className={`w-4 h-4 absolute left-3 top-1/2 -translate-y-1/2 pointer-events-none transition-colors ${
-                  normalizedSubject.length > 0
-                    ? 'text-emerald-600'
-                    : 'text-slate-400'
-                }`}
-              />
-              <input
-                type="text"
-                list="asignaturas-del-dia"
-                value={subjectQuery}
-                onChange={(e) => setSubjectQuery(e.target.value)}
-                placeholder="Buscar por nombre de asignatura o actividad (ej. Cálculo, Física, Álgebra...)"
-                aria-label="Buscar por nombre de asignatura"
-                className={`w-full pl-9 pr-9 py-2 text-sm text-slate-900 placeholder:text-slate-400 rounded-xl border transition-colors focus:outline-none focus:ring-2 ${
-                  normalizedSubject.length > 0
-                    ? 'bg-emerald-50/40 border-emerald-300 focus:ring-emerald-600 focus:border-transparent'
-                    : 'bg-slate-50 border-slate-200 focus:bg-white focus:ring-emerald-600 focus:border-transparent'
-                }`}
-              />
-              <datalist id="asignaturas-del-dia">
-                {availableSubjects.map((subj) => (
-                  <option key={subj} value={subj} />
-                ))}
-              </datalist>
-              {subjectQuery && (
-                <button
-                  type="button"
-                  onClick={() => setSubjectQuery('')}
-                  aria-label="Quitar búsqueda de asignatura"
-                  className="absolute right-2.5 top-1/2 -translate-y-1/2 p-1 text-slate-400 hover:text-slate-700 rounded-md cursor-pointer"
-                >
-                  <X className="w-4 h-4" />
-                </button>
-              )}
-            </div>
-
-            {subjectMatchSummary ? (
-              <div className="flex items-center justify-between sm:justify-end gap-3 text-xs shrink-0 tabular-nums">
-                <span className="text-emerald-800 font-medium">
-                  {subjectMatchSummary.matchingSlots}{' '}
-                  {subjectMatchSummary.matchingSlots === 1
-                    ? 'franja en verde'
-                    : 'franjas en verde'}{' '}
-                  · {subjectMatchSummary.matchingRooms}{' '}
-                  {subjectMatchSummary.matchingRooms === 1 ? 'aula' : 'aulas'}
-                </span>
-                <button
-                  type="button"
-                  onClick={() => setSubjectQuery('')}
-                  className="px-2.5 py-1.5 text-xs font-medium text-slate-700 bg-slate-100 hover:bg-slate-200 rounded-lg transition-colors whitespace-nowrap cursor-pointer"
-                >
-                  Quitar filtro
-                </button>
-              </div>
-            ) : (
-              <span className="text-xs text-slate-400 shrink-0 hidden md:inline">
-                Las horas coincidentes se marcan en verde
-              </span>
-            )}
-          </section>
-
-          {/* Clean Workspace Section Switcher */}
-          <div className="no-print flex items-center gap-1.5 p-1 bg-white border border-slate-200/90 rounded-xl overflow-x-auto">
-            <button
-              type="button"
-              onClick={() => setActiveGrid('ALL')}
-              className={`px-3.5 py-2 text-xs font-medium rounded-lg transition-colors whitespace-nowrap shrink-0 cursor-pointer ${
-                activeGrid === 'ALL'
-                  ? 'bg-slate-900 text-white shadow-xs'
-                  : 'text-slate-600 hover:text-slate-900 hover:bg-slate-100'
-              }`}
-            >
-              Todos ({ALL_UNIQUE_ROOM_NAMES.length})
-            </button>
-            {ROOM_GROUPS.map((g) => {
-              const active = activeGrid === g.id;
-              return (
+              {ROOM_GROUPS.map((g) => (
                 <button
                   key={g.id}
                   type="button"
                   onClick={() => setActiveGrid(g.id)}
+                  className={`px-2.5 py-1.5 text-xs font-medium rounded-lg whitespace-nowrap shrink-0 cursor-pointer ${
+                    activeGrid === g.id
+                      ? 'bg-red-600 text-white'
+                      : 'bg-white border border-slate-200 text-slate-600'
+                  }`}
+                >
+                  {g.shortLabel}
+                </button>
+              ))}
+            </div>
+          </div>
+
+          {/* Intuitive Calendar & Filters Sidebar */}
+          <div
+            className={`no-print w-full lg:w-auto ${
+              mobileCalendarOpen ? 'block' : 'hidden lg:block'
+            }`}
+          >
+            <CalendarSidebar
+              selectedDate={selectedDate}
+              todayIso={todayIso}
+              onSelectDate={(iso) => {
+                setSelectedDate(iso);
+                setMobileCalendarOpen(false);
+              }}
+              roomQuery={roomQuery}
+              onRoomQueryChange={setRoomQuery}
+              freeAtSlot={freeAtSlot}
+              onFreeAtSlotChange={setFreeAtSlot}
+              currentSlotIndex={currentSlotIndex}
+              autoRefresh={autoRefresh}
+              onToggleAutoRefresh={() => setAutoRefresh((v) => !v)}
+              onManualRefresh={() => fetchTimetable(selectedDate, true)}
+              isLoading={isLoading}
+              fetchedAt={timetable?.lastUpdated ?? null}
+              lastImportTimestamp={timetable?.lastImportTimestamp ?? null}
+              webUntisDirectUrl={webUntisDirectUrl}
+            />
+          </div>
+
+          {/* Main Content Viewport */}
+          <main className="flex-1 min-w-0 w-full space-y-5">
+            {/* Architectural Deep-Slate Date Hero & Week Strip */}
+            <section className="no-print bg-slate-900 text-white rounded-2xl p-5 sm:p-6 shadow-[0_6px_24px_rgba(15,23,42,0.12)] space-y-5">
+              <div className="flex flex-wrap items-start justify-between gap-4">
+                <div className="min-w-0">
+                  <p className="text-xs text-slate-400 tracking-wide">
+                    {SCHOOL_INFO.university} · {SCHOOL_INFO.name} · Centro{' '}
+                    {SCHOOL_INFO.centerCode}
+                  </p>
+                  <h1 className="text-2xl sm:text-[28px] font-bold text-white tracking-tight mt-1 [text-wrap:balance]">
+                    {fullDateLabel}
+                  </h1>
+                </div>
+
+                <div className="flex flex-wrap items-center gap-1.5 shrink-0">
+                  <button
+                    type="button"
+                    onClick={() => fetchTimetable(selectedDate, true)}
+                    disabled={isLoading}
+                    title="Sincronizar ahora con ehu.webuntis.com"
+                    className="inline-flex items-center gap-1.5 px-3 py-1.5 text-xs font-medium text-white bg-red-600 hover:bg-red-700 disabled:opacity-60 rounded-lg transition-colors whitespace-nowrap cursor-pointer"
+                  >
+                    <RefreshCw
+                      className={`w-3.5 h-3.5 ${isLoading ? 'animate-spin' : ''}`}
+                    />
+                    <span>{isLoading ? 'Actualizando...' : 'Actualizar'}</span>
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => setSelectedDate((d) => addDays(d, -1))}
+                    aria-label="Día anterior"
+                    title="Día anterior (Flecha izquierda)"
+                    className="inline-flex items-center gap-1 px-3 py-1.5 text-xs font-medium text-slate-200 bg-white/10 hover:bg-white/15 border border-white/10 rounded-lg transition-colors whitespace-nowrap cursor-pointer"
+                  >
+                    <ChevronLeft className="w-4 h-4" />
+                    <span className="hidden sm:inline">Anterior</span>
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => setSelectedDate(todayIso)}
+                    className="px-3.5 py-1.5 text-xs font-medium text-slate-900 bg-white hover:bg-slate-100 rounded-lg transition-colors whitespace-nowrap cursor-pointer"
+                  >
+                    Hoy
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => setSelectedDate((d) => addDays(d, 1))}
+                    aria-label="Día siguiente"
+                    title="Día siguiente (Flecha derecha)"
+                    className="inline-flex items-center gap-1 px-3 py-1.5 text-xs font-medium text-slate-200 bg-white/10 hover:bg-white/15 border border-white/10 rounded-lg transition-colors whitespace-nowrap cursor-pointer"
+                  >
+                    <span className="hidden sm:inline">Siguiente</span>
+                    <ChevronRight className="w-4 h-4" />
+                  </button>
+                </div>
+              </div>
+
+              {/* Interactive Monday-Saturday Week Strip with Crimson Occupancy Bars */}
+              <div
+                role="tablist"
+                aria-label="Días de la semana"
+                className="grid grid-cols-3 sm:grid-cols-6 gap-2"
+              >
+                {weekDays.map((day) => {
+                  const isSelected = day.iso === selectedDate;
+                  const isToday = day.iso === todayIso;
+                  return (
+                    <button
+                      key={day.iso}
+                      type="button"
+                      role="tab"
+                      aria-selected={isSelected}
+                      onClick={() => setSelectedDate(day.iso)}
+                      className={`px-3 py-2.5 rounded-xl text-left transition-all cursor-pointer border ${
+                        isSelected
+                          ? 'bg-white text-slate-900 border-white shadow-sm'
+                          : 'bg-white/[0.06] text-slate-200 border-white/10 hover:bg-white/[0.11]'
+                      }`}
+                    >
+                      <div className="flex items-baseline justify-between gap-1">
+                        <span className="text-xs font-semibold">
+                          {day.shortDay}{' '}
+                          <span className="font-mono tabular-nums">
+                            {day.dayNum}
+                          </span>
+                        </span>
+                        {isToday && (
+                          <span
+                            className={`text-[10px] font-semibold ${
+                              isSelected ? 'text-red-600' : 'text-red-400'
+                            }`}
+                          >
+                            Hoy
+                          </span>
+                        )}
+                      </div>
+                      <div
+                        className={`text-[11px] font-mono tabular-nums mt-0.5 truncate ${
+                          isSelected ? 'text-slate-500' : 'text-slate-400'
+                        }`}
+                      >
+                        {day.activeRooms !== null
+                          ? `${day.activeRooms} activos`
+                          : '—'}
+                      </div>
+                      <div
+                        className={`mt-2 h-1 w-full rounded-full overflow-hidden ${
+                          isSelected ? 'bg-slate-200' : 'bg-white/15'
+                        }`}
+                      >
+                        <div
+                          className="h-full bg-red-600 rounded-full transition-all duration-300"
+                          style={{ width: `${day.pct}%` }}
+                        />
+                      </div>
+                    </button>
+                  );
+                })}
+              </div>
+
+              {/* Quiet Unboxed Summary & Legend */}
+              <div className="flex flex-wrap items-center justify-between gap-3 pt-1 border-t border-white/10 text-xs text-slate-300">
+                <div className="flex flex-wrap items-center gap-2 tabular-nums">
+                  <span className="font-semibold text-white">
+                    {totals.roomCount}{' '}
+                    {totals.roomCount === 1
+                      ? 'espacio visible'
+                      : 'espacios visibles'}
+                  </span>
+                  <span className="text-white/30" aria-hidden="true">
+                    ·
+                  </span>
+                  <span>{totals.occupiedSlots} franjas ocupadas</span>
+                  <span className="text-white/30" aria-hidden="true">
+                    ·
+                  </span>
+                  <span>{totals.pct}% ocupación diaria</span>
+                  {timetable && !errorMsg && (
+                    <>
+                      <span className="text-white/30" aria-hidden="true">
+                        ·
+                      </span>
+                      <span className="inline-flex items-center gap-1 text-emerald-300 font-mono">
+                        <CheckCircle2 className="w-3.5 h-3.5" />
+                        {timetable.syncedRooms}/{timetable.totalRooms} WebUntis{' '}
+                        {formatSyncTime(timetable.lastUpdated)}
+                      </span>
+                    </>
+                  )}
+                </div>
+
+                <div className="flex flex-wrap items-center gap-4 text-xs">
+                  {normalizedSubject.length > 0 && (
+                    <span className="inline-flex items-center gap-1.5 text-emerald-300 font-medium">
+                      <span className="inline-block w-3.5 h-3 rounded-[2px] bg-emerald-600 ring-1 ring-emerald-400/60" />
+                      Asignatura buscada
+                    </span>
+                  )}
+                  {normalizedTeacher.length > 0 && (
+                    <span className="inline-flex items-center gap-1.5 text-blue-300 font-medium">
+                      <span className="inline-block w-3.5 h-3 rounded-[2px] bg-blue-600 ring-1 ring-blue-400/60" />
+                      Profesorado buscado
+                    </span>
+                  )}
+                  <span className="inline-flex items-center gap-1.5 text-slate-200">
+                    <span className="inline-block w-3.5 h-3 rounded-[2px] bg-red-600 ring-1 ring-red-400/50" />
+                    Ocupada
+                  </span>
+                  <span className="inline-flex items-center gap-1.5 text-slate-200">
+                    <span className="inline-block w-3.5 h-3 rounded-[2px] bg-white border border-slate-400" />
+                    Libre
+                  </span>
+                </div>
+              </div>
+            </section>
+
+            {/* Dedicated Dual Search Bar: Subject (green) & Faculty/Teacher (blue) */}
+            <section
+              aria-label="Buscadores por asignatura y profesorado"
+              className="no-print bg-white border border-slate-200/90 rounded-2xl shadow-[0_1px_3px_rgba(15,23,42,0.04)] p-4 space-y-3"
+            >
+              <div className="grid grid-cols-1 md:grid-cols-2 gap-3">
+                {/* Subject Search */}
+                <div className="relative min-w-0">
+                  <BookOpen
+                    className={`w-4 h-4 absolute left-3 top-1/2 -translate-y-1/2 pointer-events-none transition-colors ${
+                      normalizedSubject.length > 0
+                        ? 'text-emerald-600'
+                        : 'text-slate-400'
+                    }`}
+                  />
+                  <input
+                    type="text"
+                    list="asignaturas-del-dia"
+                    value={subjectQuery}
+                    onChange={(e) => setSubjectQuery(e.target.value)}
+                    placeholder="Buscar por asignatura o actividad (marca en verde)..."
+                    aria-label="Buscar por nombre de asignatura"
+                    className={`w-full pl-9 pr-9 py-2 text-sm text-slate-900 placeholder:text-slate-400 rounded-xl border transition-colors focus:outline-none focus:ring-2 ${
+                      normalizedSubject.length > 0
+                        ? 'bg-emerald-50/40 border-emerald-300 focus:ring-emerald-600 focus:border-transparent'
+                        : 'bg-slate-50 border-slate-200 focus:bg-white focus:ring-emerald-600 focus:border-transparent'
+                    }`}
+                  />
+                  <datalist id="asignaturas-del-dia">
+                    {availableSubjects.map((subj) => (
+                      <option key={subj} value={subj} />
+                    ))}
+                  </datalist>
+                  {subjectQuery && (
+                    <button
+                      type="button"
+                      onClick={() => setSubjectQuery('')}
+                      aria-label="Quitar búsqueda de asignatura"
+                      className="absolute right-2.5 top-1/2 -translate-y-1/2 p-1 text-slate-400 hover:text-slate-700 rounded-md cursor-pointer"
+                    >
+                      <X className="w-4 h-4" />
+                    </button>
+                  )}
+                </div>
+
+                {/* Teacher Search */}
+                <div className="relative min-w-0">
+                  <User
+                    className={`w-4 h-4 absolute left-3 top-1/2 -translate-y-1/2 pointer-events-none transition-colors ${
+                      normalizedTeacher.length > 0
+                        ? 'text-blue-600'
+                        : 'text-slate-400'
+                    }`}
+                  />
+                  <input
+                    type="text"
+                    list="profesorado-del-dia"
+                    value={teacherQuery}
+                    onChange={(e) => setTeacherQuery(e.target.value)}
+                    placeholder="Buscar por profesorado o código (marca en azul)..."
+                    aria-label="Buscar por profesorado"
+                    className={`w-full pl-9 pr-9 py-2 text-sm text-slate-900 placeholder:text-slate-400 rounded-xl border transition-colors focus:outline-none focus:ring-2 ${
+                      normalizedTeacher.length > 0
+                        ? 'bg-blue-50/40 border-blue-300 focus:ring-blue-600 focus:border-transparent'
+                        : 'bg-slate-50 border-slate-200 focus:bg-white focus:ring-blue-600 focus:border-transparent'
+                    }`}
+                  />
+                  <datalist id="profesorado-del-dia">
+                    {availableTeachers.map((teacherName) => (
+                      <option key={teacherName} value={teacherName} />
+                    ))}
+                  </datalist>
+                  {teacherQuery && (
+                    <button
+                      type="button"
+                      onClick={() => setTeacherQuery('')}
+                      aria-label="Quitar búsqueda de profesorado"
+                      className="absolute right-2.5 top-1/2 -translate-y-1/2 p-1 text-slate-400 hover:text-slate-700 rounded-md cursor-pointer"
+                    >
+                      <X className="w-4 h-4" />
+                    </button>
+                  )}
+                </div>
+              </div>
+
+              {searchMatchSummary && (
+                <div className="flex flex-wrap items-center justify-between gap-2 pt-2 border-t border-slate-100 text-xs tabular-nums">
+                  <div className="flex flex-wrap items-center gap-3">
+                    {normalizedSubject.length > 0 && (
+                      <span className="text-emerald-800 font-medium">
+                        Asignatura: {searchMatchSummary.subjectSlots}{' '}
+                        {searchMatchSummary.subjectSlots === 1
+                          ? 'franja en verde'
+                          : 'franjas en verde'}
+                      </span>
+                    )}
+                    {normalizedTeacher.length > 0 && (
+                      <span className="text-blue-800 font-medium">
+                        Profesorado: {searchMatchSummary.teacherSlots}{' '}
+                        {searchMatchSummary.teacherSlots === 1
+                          ? 'franja en azul'
+                          : 'franjas en azul'}
+                      </span>
+                    )}
+                    <span className="text-slate-500">
+                      · {searchMatchSummary.matchingRooms}{' '}
+                      {searchMatchSummary.matchingRooms === 1
+                        ? 'aula coincidente'
+                        : 'aulas coincidentes'}
+                    </span>
+                  </div>
+                  <button
+                    type="button"
+                    onClick={() => {
+                      setSubjectQuery('');
+                      setTeacherQuery('');
+                    }}
+                    className="px-2.5 py-1 text-xs font-medium text-slate-700 bg-slate-100 hover:bg-slate-200 rounded-lg transition-colors whitespace-nowrap cursor-pointer"
+                  >
+                    Limpiar búsqueda
+                  </button>
+                </div>
+              )}
+            </section>
+
+            {/* Clean Workspace Section Switcher + Custom Print Center Actions */}
+            <div className="no-print flex flex-wrap items-center justify-between gap-3">
+              <div className="flex items-center gap-1.5 p-1 bg-white border border-slate-200/90 rounded-xl overflow-x-auto max-w-full">
+                <button
+                  type="button"
+                  onClick={() => setActiveGrid('ALL')}
                   className={`px-3.5 py-2 text-xs font-medium rounded-lg transition-colors whitespace-nowrap shrink-0 cursor-pointer ${
-                    active
-                      ? 'bg-red-600 text-white shadow-xs'
+                    activeGrid === 'ALL'
+                      ? 'bg-slate-900 text-white shadow-xs'
                       : 'text-slate-600 hover:text-slate-900 hover:bg-slate-100'
                   }`}
                 >
-                  {g.title}{' '}
-                  <span
-                    className={`font-mono tabular-nums ${
-                      active ? 'text-red-100' : 'text-slate-400'
-                    }`}
-                  >
-                    ({g.rooms.length})
-                  </span>
+                  Todos ({ALL_UNIQUE_ROOM_NAMES.length})
                 </button>
-              );
-            })}
-          </div>
-
-          {/* Error State */}
-          {errorMsg && (
-            <div
-              role="alert"
-              className="no-print bg-white border border-red-200 rounded-2xl p-5 flex flex-wrap items-center justify-between gap-4"
-            >
-              <div className="flex items-start gap-3">
-                <AlertCircle className="w-5 h-5 text-red-600 shrink-0 mt-0.5" />
-                <div>
-                  <h2 className="text-sm font-semibold text-slate-900">
-                    Error de sincronización con WebUntis
-                  </h2>
-                  <p className="text-xs text-slate-600 mt-0.5">{errorMsg}</p>
-                </div>
+                {ROOM_GROUPS.map((g) => {
+                  const active = activeGrid === g.id;
+                  return (
+                    <button
+                      key={g.id}
+                      type="button"
+                      onClick={() => setActiveGrid(g.id)}
+                      className={`px-3.5 py-2 text-xs font-medium rounded-lg transition-colors whitespace-nowrap shrink-0 cursor-pointer ${
+                        active
+                          ? 'bg-red-600 text-white shadow-xs'
+                          : 'text-slate-600 hover:text-slate-900 hover:bg-slate-100'
+                      }`}
+                    >
+                      {g.title}{' '}
+                      <span
+                        className={`font-mono tabular-nums ${
+                          active ? 'text-red-100' : 'text-slate-400'
+                        }`}
+                      >
+                        ({g.rooms.length})
+                      </span>
+                    </button>
+                  );
+                })}
               </div>
-              <button
-                type="button"
-                onClick={() => fetchTimetable(selectedDate, true)}
-                className="inline-flex items-center gap-1.5 px-3.5 py-2 text-xs font-medium text-white bg-slate-900 hover:bg-slate-800 rounded-lg cursor-pointer whitespace-nowrap"
-              >
-                <RefreshCw className="w-3.5 h-3.5" />
-                <span>Reintentar</span>
-              </button>
-            </div>
-          )}
 
-          {/* Loading Skeleton */}
-          {isLoading && !timetable && (
-            <div className="no-print space-y-5" aria-busy="true">
-              {ROOM_GROUPS.map((g) => (
-                <div
-                  key={g.id}
-                  className="bg-white border border-slate-200 rounded-2xl overflow-hidden"
-                >
-                  <div className="px-5 py-4 border-b border-slate-200 flex items-center justify-between">
-                    <div className="space-y-1.5">
-                      <div className="h-4 w-48 bg-slate-200 rounded animate-pulse" />
-                      <div className="h-2 w-32 bg-slate-100 rounded animate-pulse" />
-                    </div>
-                    <div className="h-8 w-36 bg-slate-100 rounded-lg animate-pulse" />
-                  </div>
-                  <div className="p-4 space-y-2">
-                    {Array.from({ length: Math.min(g.rooms.length, 6) }).map(
-                      (_, idx) => (
-                        <div
-                          key={idx}
-                          className="h-6 w-full bg-slate-100 rounded animate-pulse"
-                        />
-                      )
-                    )}
-                  </div>
-                </div>
-              ))}
-            </div>
-          )}
-
-          {/* Populated Grids */}
-          {timetable && filteredGrids.length > 0 && (
-            <div
-              className={`space-y-6 transition-opacity duration-150 ${
-                isLoading ? 'opacity-65' : 'opacity-100'
-              }`}
-            >
-              {filteredGrids.map((grid) => (
-                <TimetableGrid
-                  key={grid.id}
-                  grid={grid}
-                  dateIso={timetable.date}
-                  currentSlotIndex={currentSlotIndex}
-                  highlightedSlotIndex={freeAtSlot}
-                  subjectQuery={subjectQuery}
-                  onSelectSubject={setSubjectQuery}
-                  onPrintGrid={handlePrintGrid}
-                />
-              ))}
-            </div>
-          )}
-
-          {/* Empty Filter State */}
-          {timetable && !isLoading && filteredGrids.length === 0 && (
-            <div className="no-print bg-white border border-slate-200 rounded-2xl p-10 text-center space-y-3">
-              <p className="text-sm font-semibold text-slate-900">
-                No hay espacios que coincidan con los filtros activos
-              </p>
-              <p className="text-xs text-slate-500 max-w-md mx-auto">
-                Prueba con otro código de aula, cambia la franja horaria o
-                selecciona todos los apartados para ver los{' '}
-                {ALL_UNIQUE_ROOM_NAMES.length} espacios del centro.
-              </p>
-              <div className="pt-1">
+              <div className="flex items-center gap-1.5 shrink-0">
                 <button
                   type="button"
-                  onClick={() => {
-                    setActiveGrid('ALL');
-                    setRoomQuery('');
-                    setSubjectQuery('');
-                    setFreeAtSlot(null);
-                  }}
-                  className="px-4 py-2 text-xs font-medium text-white bg-slate-900 hover:bg-slate-800 rounded-lg transition-colors cursor-pointer"
+                  onClick={() => openPrintModal('grids')}
+                  disabled={!timetable || isLoading}
+                  className="inline-flex items-center gap-1.5 px-3 py-2 text-xs font-medium text-slate-700 bg-white border border-slate-200 hover:bg-slate-50 hover:border-slate-300 disabled:opacity-50 rounded-xl transition-colors whitespace-nowrap cursor-pointer"
                 >
-                  Restablecer filtros
+                  <Layers className="w-3.5 h-3.5 text-slate-500" />
+                  <span>Imprimir varios bloques</span>
+                </button>
+                <button
+                  type="button"
+                  onClick={() => openPrintModal('summary')}
+                  disabled={!timetable || isLoading}
+                  className="inline-flex items-center gap-1.5 px-3 py-2 text-xs font-medium text-slate-700 bg-white border border-slate-200 hover:bg-slate-50 hover:border-slate-300 disabled:opacity-50 rounded-xl transition-colors whitespace-nowrap cursor-pointer"
+                >
+                  <FileSpreadsheet className="w-3.5 h-3.5 text-slate-500" />
+                  <span>Sumario de aulas</span>
                 </button>
               </div>
             </div>
-          )}
-        </main>
+
+            {/* Error State */}
+            {errorMsg && (
+              <div
+                role="alert"
+                className="no-print bg-white border border-red-200 rounded-2xl p-5 flex flex-wrap items-center justify-between gap-4"
+              >
+                <div className="flex items-start gap-3">
+                  <AlertCircle className="w-5 h-5 text-red-600 shrink-0 mt-0.5" />
+                  <div>
+                    <h2 className="text-sm font-semibold text-slate-900">
+                      Error de sincronización con WebUntis
+                    </h2>
+                    <p className="text-xs text-slate-600 mt-0.5">{errorMsg}</p>
+                  </div>
+                </div>
+                <button
+                  type="button"
+                  onClick={() => fetchTimetable(selectedDate, true)}
+                  className="inline-flex items-center gap-1.5 px-3.5 py-2 text-xs font-medium text-white bg-slate-900 hover:bg-slate-800 rounded-lg cursor-pointer whitespace-nowrap"
+                >
+                  <RefreshCw className="w-3.5 h-3.5" />
+                  <span>Reintentar</span>
+                </button>
+              </div>
+            )}
+
+            {/* Loading Skeleton */}
+            {isLoading && !timetable && (
+              <div className="no-print space-y-5" aria-busy="true">
+                {ROOM_GROUPS.map((g) => (
+                  <div
+                    key={g.id}
+                    className="bg-white border border-slate-200 rounded-2xl overflow-hidden"
+                  >
+                    <div className="px-5 py-4 border-b border-slate-200 flex items-center justify-between">
+                      <div className="space-y-1.5">
+                        <div className="h-4 w-48 bg-slate-200 rounded animate-pulse" />
+                        <div className="h-2 w-32 bg-slate-100 rounded animate-pulse" />
+                      </div>
+                      <div className="h-8 w-36 bg-slate-100 rounded-lg animate-pulse" />
+                    </div>
+                    <div className="p-4 space-y-2">
+                      {Array.from({ length: Math.min(g.rooms.length, 6) }).map(
+                        (_, idx) => (
+                          <div
+                            key={idx}
+                            className="h-6 w-full bg-slate-100 rounded animate-pulse"
+                          />
+                        )
+                      )}
+                    </div>
+                  </div>
+                ))}
+              </div>
+            )}
+
+            {/* Populated Grids */}
+            {timetable && filteredGrids.length > 0 && (
+              <div
+                className={`space-y-6 transition-opacity duration-150 ${
+                  isLoading ? 'opacity-65' : 'opacity-100'
+                }`}
+              >
+                {filteredGrids.map((grid) => (
+                  <TimetableGrid
+                    key={grid.id}
+                    grid={grid}
+                    dateIso={timetable.date}
+                    currentSlotIndex={currentSlotIndex}
+                    highlightedSlotIndex={freeAtSlot}
+                    subjectQuery={subjectQuery}
+                    teacherQuery={teacherQuery}
+                    onSelectSubject={setSubjectQuery}
+                    onSelectTeacher={setTeacherQuery}
+                    onPrintGrid={handlePrintGrid}
+                  />
+                ))}
+              </div>
+            )}
+
+            {/* Empty Filter State */}
+            {timetable && !isLoading && filteredGrids.length === 0 && (
+              <div className="no-print bg-white border border-slate-200 rounded-2xl p-10 text-center space-y-3">
+                <p className="text-sm font-semibold text-slate-900">
+                  No hay espacios que coincidan con los filtros activos
+                </p>
+                <p className="text-xs text-slate-500 max-w-md mx-auto">
+                  Prueba con otro código de aula, asignatura, profesorado o
+                  cambia la franja horaria para ver los{' '}
+                  {ALL_UNIQUE_ROOM_NAMES.length} espacios del centro.
+                </p>
+                <div className="pt-1">
+                  <button
+                    type="button"
+                    onClick={() => {
+                      setActiveGrid('ALL');
+                      setRoomQuery('');
+                      setSubjectQuery('');
+                      setTeacherQuery('');
+                      setFreeAtSlot(null);
+                    }}
+                    className="px-4 py-2 text-xs font-medium text-white bg-slate-900 hover:bg-slate-800 rounded-lg transition-colors cursor-pointer"
+                  >
+                    Restablecer filtros
+                  </button>
+                </div>
+              </div>
+            )}
+          </main>
+        </div>
+
+        {/* Quiet Institutional Footer */}
+        <footer className="no-print border-t border-slate-200/90 bg-white mt-8">
+          <div className="max-w-[1440px] mx-auto px-4 sm:px-6 py-4 flex flex-wrap items-center justify-between gap-3 text-xs text-slate-500">
+            <span>
+              {SCHOOL_INFO.university} · {SCHOOL_INFO.name} (Centro{' '}
+              {SCHOOL_INFO.centerCode})
+            </span>
+            <span>
+              Sincronización en vivo con ehu.webuntis.com · Impresión en A4
+              horizontal
+            </span>
+          </div>
+        </footer>
       </div>
 
-      {/* Quiet Institutional Footer */}
-      <footer className="no-print border-t border-slate-200/90 bg-white mt-8">
-        <div className="max-w-[1440px] mx-auto px-4 sm:px-6 py-4 flex flex-wrap items-center justify-between gap-3 text-xs text-slate-500">
-          <span>
-            {SCHOOL_INFO.university} · {SCHOOL_INFO.name} (Centro{' '}
-            {SCHOOL_INFO.centerCode})
-          </span>
-          <span>
-            Sincronización en vivo con ehu.webuntis.com · Impresión en A4
-            horizontal
-          </span>
-        </div>
-      </footer>
-    </div>
+      {/* Print Center Modal (Multi-block & Custom Classroom Summary) */}
+      {timetable && (
+        <PrintCenterModal
+          isOpen={printModalOpen}
+          onClose={() => setPrintModalOpen(false)}
+          grids={timetable.grids}
+          dateIso={timetable.date}
+          initialTab={printModalTab}
+          onExecutePrint={executePrintJob}
+        />
+      )}
+
+      {/* Dedicated A4 Landscape Print Sheet */}
+      {timetable && (
+        <PrintSheet
+          config={printJob}
+          grids={timetable.grids}
+          dateIso={timetable.date}
+          subjectQuery={subjectQuery}
+          teacherQuery={teacherQuery}
+        />
+      )}
+    </>
   );
 }

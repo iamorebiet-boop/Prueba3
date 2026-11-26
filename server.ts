@@ -16,6 +16,9 @@ import type {
   PeriodDetail,
   RoomDaySchedule,
   SlotState,
+  TeacherDaySession,
+  TeacherInfo,
+  TeacherScheduleResponse,
   WeekDaySummary,
 } from './src/data/roomGroups.ts';
 
@@ -31,6 +34,7 @@ const DIRECTORY_TTL_MS = 6 * 60 * 60 * 1000;
 const WEEK_CACHE_TTL_MS = 15 * 60 * 1000;
 const REFRESH_COOLDOWN_MS = 15 * 1000;
 const MAX_CACHED_WEEKS = 14;
+const MAX_CACHED_TEACHERS = 120;
 const FETCH_CONCURRENCY = 14;
 
 interface SessionState {
@@ -47,6 +51,8 @@ interface RoomDirectoryEntry {
 
 interface DirectoryState {
   roomsByName: Map<string, RoomDirectoryEntry>;
+  teachersById: Map<number, TeacherInfo>;
+  teachersByCode: Map<string, TeacherInfo>;
   formatId: number;
   lastImportTimestamp: number | null;
   fetchedAt: number;
@@ -56,6 +62,7 @@ interface RawWebUntisElement {
   type: number;
   id: number;
   name?: string;
+  forename?: string;
   longName?: string;
   displayname?: string;
   alternatename?: string;
@@ -95,12 +102,19 @@ interface WeekCacheEntry {
   byDateAndRoom: Map<string, Map<string, PeriodDetail[]>>;
 }
 
+interface TeacherWeekCacheEntry {
+  fetchedAt: number;
+  byDate: Map<string, TeacherDaySession[]>;
+}
+
 let sessionCache: SessionState | null = null;
 let sessionPromise: Promise<SessionState> | null = null;
 let directoryCache: DirectoryState | null = null;
 let directoryPromise: Promise<DirectoryState> | null = null;
 const weekCache = new Map<string, WeekCacheEntry>();
 const weekInFlight = new Map<string, Promise<WeekCacheEntry>>();
+const teacherWeekCache = new Map<string, TeacherWeekCacheEntry>();
+const teacherWeekInFlight = new Map<string, Promise<TeacherWeekCacheEntry>>();
 const lastManualRefresh = new Map<string, number>();
 
 function isValidISODate(value: string): boolean {
@@ -141,6 +155,38 @@ function formatUntisTime(hhmm: number): string {
   const h = Math.floor(hhmm / 100);
   const m = hhmm % 100;
   return `${String(h).padStart(2, '0')}:${String(m).padStart(2, '0')}`;
+}
+
+function toTitleCaseName(raw: string): string {
+  const minor = new Set(['de', 'del', 'la', 'las', 'los', 'y', 'e', 'i']);
+  return raw
+    .trim()
+    .split(/\s+/)
+    .map((word, idx) => {
+      const lower = word.toLowerCase();
+      if (idx > 0 && minor.has(lower)) return lower;
+      return lower
+        .split('-')
+        .map((part) => (part ? part.charAt(0).toUpperCase() + part.slice(1) : ''))
+        .join('-');
+    })
+    .join(' ');
+}
+
+function formatTeacherFullName(el: RawWebUntisElement): string {
+  const forename = (el.forename || '').trim();
+  const surname = (el.longName || '').trim();
+  const code = (el.name || '').trim();
+  if (forename && surname && surname !== code) {
+    return toTitleCaseName(`${forename} ${surname}`);
+  }
+  if (surname && surname !== code) {
+    return toTitleCaseName(surname);
+  }
+  if (el.displayname && el.displayname !== code) {
+    return toTitleCaseName(el.displayname);
+  }
+  return code || String(el.id);
 }
 
 function extractCookies(response: Response): string {
@@ -246,16 +292,25 @@ async function getRoomDirectory(forceRefresh = false): Promise<DirectoryState> {
 
   const promise = (async (): Promise<DirectoryState> => {
     try {
-      const payload = await fetchWebUntisJson<{
-        data?: {
-          elements?: RawWebUntisElement[];
-          formats?: Array<{ id: number; name?: string }>;
-          lastImportTimestamp?: number;
-        };
-      }>('/api/public/timetable/weekly/pageconfig?type=4');
+      const [roomsPayload, teachersPayload] = await Promise.all([
+        fetchWebUntisJson<{
+          data?: {
+            elements?: RawWebUntisElement[];
+            formats?: Array<{ id: number; name?: string }>;
+            lastImportTimestamp?: number;
+          };
+        }>('/api/public/timetable/weekly/pageconfig?type=4'),
+        fetchWebUntisJson<{
+          data?: {
+            elements?: RawWebUntisElement[];
+          };
+        }>('/api/public/timetable/weekly/pageconfig?type=2').catch(() => ({
+          data: { elements: [] },
+        })),
+      ]);
 
-      const elements = payload.data?.elements ?? [];
-      const formats = payload.data?.formats ?? [];
+      const elements = roomsPayload.data?.elements ?? [];
+      const formats = roomsPayload.data?.formats ?? [];
       const eibFormat = formats.find(
         (f) => f.id === DEFAULT_FORMAT_ID || f.name?.includes(CENTER_CODE)
       );
@@ -281,12 +336,28 @@ async function getRoomDirectory(forceRefresh = false): Promise<DirectoryState> {
         }
       }
 
+      const teachersById = new Map<number, TeacherInfo>();
+      const teachersByCode = new Map<string, TeacherInfo>();
+      for (const t of teachersPayload.data?.elements ?? []) {
+        if (t && typeof t.id === 'number' && typeof t.name === 'string') {
+          const info: TeacherInfo = {
+            id: t.id,
+            code: t.name.trim(),
+            fullName: formatTeacherFullName(t),
+          };
+          teachersById.set(t.id, info);
+          teachersByCode.set(info.code.toUpperCase(), info);
+        }
+      }
+
       const state: DirectoryState = {
         roomsByName,
+        teachersById,
+        teachersByCode,
         formatId,
         lastImportTimestamp:
-          typeof payload.data?.lastImportTimestamp === 'number'
-            ? payload.data.lastImportTimestamp
+          typeof roomsPayload.data?.lastImportTimestamp === 'number'
+            ? roomsPayload.data.lastImportTimestamp
             : null,
         fetchedAt: Date.now(),
       };
@@ -327,6 +398,7 @@ async function mapWithConcurrency<T, R>(
 
 function parseRoomWeeklyPeriods(
   roomId: number,
+  directory: DirectoryState,
   rawData: {
     data?: {
       result?: {
@@ -368,23 +440,42 @@ function parseRoomWeeklyPeriods(
     const subjectsAlt: string[] = [];
     const groups: string[] = [];
     const teachers: string[] = [];
+    const teacherDetails: TeacherInfo[] = [];
+    const seenTeacherIds = new Set<number>();
 
     for (const ref of period.elements ?? []) {
       const info = elementLookup.get(`${ref.type}:${ref.id}`);
-      if (!info) continue;
-      if (ref.type === 3) {
+      if (ref.type === 3 && info) {
         const primary = (info.longName || info.name || '').trim();
         const alt = (info.alternatename || '').trim();
         if (primary && !subjects.includes(primary)) subjects.push(primary);
         if (alt && alt !== primary && !subjectsAlt.includes(alt)) {
           subjectsAlt.push(alt);
         }
-      } else if (ref.type === 1) {
+      } else if (ref.type === 1 && info) {
         const label = (info.name || info.longName || '').trim();
         if (label && !groups.includes(label)) groups.push(label);
       } else if (ref.type === 2) {
-        const label = (info.longName || info.name || '').trim();
-        if (label && !teachers.includes(label)) teachers.push(label);
+        const dirTeacher = directory.teachersById.get(ref.id);
+        const fallbackCode = (info?.name || '').trim();
+        const resolved: TeacherInfo =
+          dirTeacher ??
+          (fallbackCode
+            ? directory.teachersByCode.get(fallbackCode.toUpperCase())
+            : undefined) ?? {
+            id: ref.id,
+            code: fallbackCode || String(ref.id),
+            fullName: info
+              ? formatTeacherFullName(info)
+              : fallbackCode || String(ref.id),
+          };
+        if (!seenTeacherIds.has(resolved.id)) {
+          seenTeacherIds.add(resolved.id);
+          teacherDetails.push(resolved);
+          if (!teachers.includes(resolved.fullName)) {
+            teachers.push(resolved.fullName);
+          }
+        }
       }
     }
 
@@ -404,6 +495,7 @@ function parseRoomWeeklyPeriods(
       subjectAlt: subjectsAlt.join(' / '),
       groups,
       teachers,
+      teacherDetails,
       lessonText: (period.lessonText || '').trim(),
       periodText: (period.periodText || '').trim(),
       substText: (period.substText || '').trim(),
@@ -421,6 +513,108 @@ function parseRoomWeeklyPeriods(
   for (const [, list] of byDate) {
     list.sort((a, b) => a.startTime - b.startTime || a.endTime - b.endTime);
   }
+  return byDate;
+}
+
+function parseTeacherWeeklyPeriods(
+  rawData: {
+    data?: {
+      result?: {
+        data?: {
+          elementPeriods?: Record<string, RawWebUntisPeriod[]>;
+          elements?: RawWebUntisElement[];
+        };
+      };
+    };
+  },
+  teacherId: number
+): Map<string, TeacherDaySession[]> {
+  const byDate = new Map<string, TeacherDaySession[]>();
+  const resultData = rawData.data?.result?.data;
+  if (!resultData) return byDate;
+
+  const elementLookup = new Map<string, RawWebUntisElement>();
+  for (const el of resultData.elements ?? []) {
+    elementLookup.set(`${el.type}:${el.id}`, el);
+  }
+
+  const rawPeriods = resultData.elementPeriods?.[String(teacherId)] ?? [];
+  for (const period of rawPeriods) {
+    const cellState = (period.cellState ?? 'STANDARD').toUpperCase();
+    const isCancelled =
+      cellState === 'CANCEL' ||
+      cellState === 'FREE' ||
+      Boolean(period.is?.cancelled);
+    if (isCancelled) continue;
+
+    const subjects: string[] = [];
+    const groups: string[] = [];
+    const rooms: string[] = [];
+
+    for (const ref of period.elements ?? []) {
+      const info = elementLookup.get(`${ref.type}:${ref.id}`);
+      if (!info) continue;
+      if (ref.type === 3) {
+        const label = (info.longName || info.name || '').trim();
+        if (label && !subjects.includes(label)) subjects.push(label);
+      } else if (ref.type === 1) {
+        const label = (info.name || info.longName || '').trim();
+        if (label && !groups.includes(label)) groups.push(label);
+      } else if (ref.type === 4) {
+        if (ref.state === 'ABSENT' || ref.state === 'CANCEL') continue;
+        const label = (info.name || info.longName || '').trim();
+        if (label && !rooms.includes(label)) rooms.push(label);
+      }
+    }
+
+    const dateKey = String(period.date);
+    const sessionItem: TeacherDaySession = {
+      id: period.id,
+      startTime: period.startTime,
+      endTime: period.endTime,
+      startLabel: formatUntisTime(period.startTime),
+      endLabel: formatUntisTime(period.endTime),
+      subject:
+        subjects.join(' / ') ||
+        (period.lessonText || '').trim() ||
+        (period.periodText || '').trim() ||
+        'Actividad / Reserva',
+      groups,
+      rooms,
+      lessonText: (period.lessonText || '').trim(),
+      isExam: cellState === 'EXAM' || Boolean(period.is?.exam),
+    };
+
+    const existing = byDate.get(dateKey);
+    if (existing) {
+      existing.push(sessionItem);
+    } else {
+      byDate.set(dateKey, [sessionItem]);
+    }
+  }
+
+  // Merge consecutive periods of the same session in the same rooms
+  for (const [dateKey, list] of byDate) {
+    list.sort((a, b) => a.startTime - b.startTime || a.endTime - b.endTime);
+    const merged: TeacherDaySession[] = [];
+    for (const item of list) {
+      const prev = merged[merged.length - 1];
+      if (
+        prev &&
+        prev.endTime === item.startTime &&
+        prev.subject === item.subject &&
+        prev.rooms.join(',') === item.rooms.join(',') &&
+        prev.groups.join(',') === item.groups.join(',')
+      ) {
+        prev.endTime = item.endTime;
+        prev.endLabel = item.endLabel;
+      } else {
+        merged.push({ ...item });
+      }
+    }
+    byDate.set(dateKey, merged);
+  }
+
   return byDate;
 }
 
@@ -479,7 +673,7 @@ async function fetchWeekData(
           };
         }>(query);
         syncedRooms += 1;
-        const roomByDate = parseRoomWeeklyPeriods(entry.id, raw);
+        const roomByDate = parseRoomWeeklyPeriods(entry.id, directory, raw);
         for (const [dateKey, periods] of roomByDate) {
           let dateMap = byDateAndRoom.get(dateKey);
           if (!dateMap) {
@@ -526,6 +720,62 @@ async function fetchWeekData(
     throw err;
   } finally {
     weekInFlight.delete(weekKey);
+  }
+}
+
+async function fetchTeacherWeekData(
+  teacherId: number,
+  weekKey: string,
+  directory: DirectoryState
+): Promise<TeacherWeekCacheEntry> {
+  const cacheKey = `${teacherId}:${weekKey}`;
+  const existing = teacherWeekCache.get(cacheKey);
+  if (existing && Date.now() - existing.fetchedAt < WEEK_CACHE_TTL_MS) {
+    return existing;
+  }
+
+  const inFlight = teacherWeekInFlight.get(cacheKey);
+  if (inFlight) {
+    return inFlight;
+  }
+
+  const promise = (async (): Promise<TeacherWeekCacheEntry> => {
+    const query = `/api/public/timetable/weekly/data?elementType=2&elementId=${teacherId}&date=${encodeURIComponent(weekKey)}&formatId=${directory.formatId}`;
+    const raw = await fetchWebUntisJson<{
+      data?: {
+        result?: {
+          data?: {
+            elementPeriods?: Record<string, RawWebUntisPeriod[]>;
+            elements?: RawWebUntisElement[];
+          };
+        };
+      };
+    }>(query);
+    const byDate = parseTeacherWeeklyPeriods(raw, teacherId);
+    const entry: TeacherWeekCacheEntry = {
+      fetchedAt: Date.now(),
+      byDate,
+    };
+    if (teacherWeekCache.size >= MAX_CACHED_TEACHERS) {
+      let oldestKey: string | null = null;
+      let oldestTime = Infinity;
+      for (const [k, v] of teacherWeekCache) {
+        if (v.fetchedAt < oldestTime) {
+          oldestTime = v.fetchedAt;
+          oldestKey = k;
+        }
+      }
+      if (oldestKey) teacherWeekCache.delete(oldestKey);
+    }
+    teacherWeekCache.set(cacheKey, entry);
+    return entry;
+  })();
+
+  teacherWeekInFlight.set(cacheKey, promise);
+  try {
+    return await promise;
+  } finally {
+    teacherWeekInFlight.delete(cacheKey);
   }
 }
 
@@ -691,6 +941,53 @@ async function startServer(): Promise<void> {
       res.status(502).json({
         error:
           'No se pudo conectar con WebUntis en este momento. Inténtalo de nuevo.',
+      });
+    }
+  });
+
+  app.get('/api/teacher-schedule', async (req, res) => {
+    const rawDate =
+      typeof req.query.date === 'string' ? req.query.date.trim() : '';
+    const rawTeacherId =
+      typeof req.query.teacherId === 'string' ? req.query.teacherId.trim() : '';
+    const teacherId = Number(rawTeacherId);
+
+    if (!isValidISODate(rawDate)) {
+      res.status(400).json({ error: 'Formato de fecha no válido.' });
+      return;
+    }
+    if (!Number.isInteger(teacherId) || teacherId <= 0) {
+      res.status(400).json({ error: 'Identificador de docente no válido.' });
+      return;
+    }
+
+    try {
+      const weekKey = getMondayKey(rawDate);
+      const directory = await getRoomDirectory(false);
+      const weekData = await fetchTeacherWeekData(teacherId, weekKey, directory);
+      const dateCompact = rawDate.replaceAll('-', '');
+      const sessions = weekData.byDate.get(dateCompact) ?? [];
+      const teacher = directory.teachersById.get(teacherId) ?? {
+        id: teacherId,
+        code: String(teacherId),
+        fullName: String(teacherId),
+      };
+
+      const payload: TeacherScheduleResponse = {
+        date: rawDate,
+        teacher,
+        sessions,
+      };
+      res.setHeader('Cache-Control', 'no-store');
+      res.json(payload);
+    } catch (err) {
+      const message =
+        err instanceof Error
+          ? err.message
+          : 'Error al consultar el horario del docente.';
+      console.error('[WebUntis Teacher API Error]', message);
+      res.status(502).json({
+        error: 'No se pudo cargar el horario completo del docente.',
       });
     }
   });

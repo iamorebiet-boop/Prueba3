@@ -121,6 +121,12 @@ export const ALL_UNIQUE_ROOM_NAMES: string[] = Array.from(
 
 export type SlotState = 'free' | 'occupied' | 'exam';
 
+export interface TeacherInfo {
+  id: number;
+  code: string;
+  fullName: string;
+}
+
 export interface PeriodDetail {
   id: number;
   startTime: number;
@@ -132,10 +138,30 @@ export interface PeriodDetail {
   subjectAlt: string;
   groups: string[];
   teachers: string[];
+  teacherDetails: TeacherInfo[];
   lessonText: string;
   periodText: string;
   substText: string;
   isExam: boolean;
+}
+
+export interface TeacherDaySession {
+  id: number;
+  startTime: number;
+  endTime: number;
+  startLabel: string;
+  endLabel: string;
+  subject: string;
+  groups: string[];
+  rooms: string[];
+  lessonText: string;
+  isExam: boolean;
+}
+
+export interface TeacherScheduleResponse {
+  date: string;
+  teacher: TeacherInfo;
+  sessions: TeacherDaySession[];
 }
 
 export interface RoomDaySchedule {
